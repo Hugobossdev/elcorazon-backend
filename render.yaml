@@ -1,0 +1,231 @@
+# Blueprint Render — El Corazón, API seule.
+#
+# Périmètre : le service web, PostgreSQL et Key Value, tous en offre gratuite.
+# Celery n'y figure pas : Render ne propose aucune instance gratuite pour les
+# `worker`, et les six tâches planifiées de `config/celery.py` ne tournent donc
+# pas. Purge des positions, expiration des points, renouvellement des
+# abonnements et fermeture des paniers de groupe restent à l'arrêt — c'est un
+# déploiement de démonstration, pas une exploitation. Les brancher est un ajout
+# de deux blocs `type: worker` en offre payante, sans autre changement.
+#
+# Ce que l'offre gratuite implique, et qu'il vaut mieux savoir avant :
+#   — le service web s'endort après quinze minutes sans requête, et la requête
+#     suivante attend son réveil, une trentaine de secondes ;
+#   — la base gratuite est supprimée au bout d'un mois ;
+#   — Key Value gratuit ne persiste rien : son contenu disparaît à chaque
+#     redémarrage. Sans Celery, il ne porte que le cache et la couche de
+#     canaux, que cette volatilité n'endommage pas.
+
+services:
+  - type: web
+    name: elcorazon-api
+    runtime: docker
+    plan: free
+    # Francfort est la région la plus proche de l'Afrique de l'Ouest : environ
+    # 90 ms depuis Lomé, contre 140 ms par la Virginie et davantage par l'Oregon.
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # Sonde de vivacité sans accès base (`config/urls.py`), déjà exemptée de la
+    # redirection HTTPS par `SECURE_REDIRECT_EXEMPT` dans `prod.py` : Render
+    # l'interroge en clair sur l'adresse interne, et un 301 compterait comme un
+    # échec — le déploiement serait annulé alors que l'application va bien.
+    healthCheckPath: /health/
+    autoDeployTrigger: commit
+
+    # Migrations et fichiers statiques au démarrage, et non en `preDeployCommand` :
+    # celle-ci est réservée aux offres payantes. Sur une instance unique c'est
+    # équivalent ; le jour où le service passe à plusieurs instances, il faudra
+    # déplacer `migrate` dans un `preDeployCommand` pour qu'il ne s'exécute pas
+    # en parallèle sur chacune.
+    #
+    # `collectstatic` ici et non dans le Dockerfile : `base.py` lit
+    # `DJANGO_SECRET_KEY` à l'import et n'a pas de valeur de repli, donc aucune
+    # commande Django ne s'exécute au moment de la construction de l'image.
+    #
+    # `uvicorn` seul, sans Gunicorn — qui n'est d'ailleurs pas dans les
+    # dépendances : l'offre gratuite alloue 0,1 vCPU et 512 Mio, où un maître
+    # plus un worker ne font que consommer de la mémoire. C'est aussi ce que
+    # fait le `CMD` de l'image.
+    #
+    # `--proxy-headers` est volontairement absent : Django lit
+    # `X-Forwarded-Proto` directement dans les en-têtes
+    # (`SECURE_PROXY_SSL_HEADER`) et DRF lit `X-Forwarded-For` de même
+    # (`NUM_PROXIES`). L'activer ferait dériver `REMOTE_ADDR` d'un en-tête que
+    # le client peut forger, sans rien apporter.
+    dockerCommand: >-
+      sh -c "python manage.py migrate --noinput &&
+      python manage.py collectstatic --noinput &&
+      exec uvicorn config.asgi:application --host 0.0.0.0 --port ${PORT:-8000}"
+
+    envVars:
+      - key: DJANGO_SETTINGS_MODULE
+        value: config.settings.prod
+
+      # `generateValue` engendre 256 bits aléatoires à la création et les
+      # conserve : la clé n'existe nulle part ailleurs, surtout pas dans ce dépôt.
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+
+      # Le nom d'hôte attribué par Render (`elcorazon-api.onrender.com`). À
+      # compléter à la main le jour où un domaine propre est branché : la
+      # variable accepte une liste séparée par des virgules.
+      - key: DJANGO_ALLOWED_HOSTS
+        fromService:
+          name: elcorazon-api
+          type: web
+          property: host
+
+      # ------------------------------------------------------- base de données
+      #
+      # Render ne publie sa base que sous forme d'URL unique. `base.py` sait la
+      # décomposer et lui donne la priorité sur les variables `POSTGRES_*`.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: elcorazon-db
+          property: connectionString
+
+      # Redondant avec l'URL ci-dessus pour se connecter, mais pas pour démarrer :
+      # le garde-fou de `prod.py` exige `POSTGRES_PASSWORD` non vide et lève une
+      # `RuntimeError` sinon. Sans cette ligne, l'application refuse de charger
+      # alors que sa base est parfaitement joignable.
+      - key: POSTGRES_PASSWORD
+        fromDatabase:
+          name: elcorazon-db
+          property: password
+
+      - key: POSTGRES_CONN_MAX_AGE
+        value: "60"
+
+      - key: GIS_ENABLED
+        value: "True"
+
+      # ------------------------------------------------------- cache et canaux
+      - key: REDIS_URL
+        fromService:
+          name: elcorazon-keyvalue
+          type: keyvalue
+          property: connectionString
+
+      # ------------------------------------------------------- réseau
+      #
+      # Un proxy entre le client et l'application : celui de Render. **Réglage
+      # de sécurité** — sans lui, DRF prend la chaîne `X-Forwarded-For` entière
+      # pour identité, qu'un client forge à volonté, et la limitation par
+      # adresse IP ne compte plus rien.
+      - key: NUM_PROXIES
+        value: "1"
+
+      - key: LOG_LEVEL
+        value: INFO
+
+      # ------------------------------------------------------- JWT (ADR-004)
+      #
+      # Paire RSA au format PEM, sauts de ligne échappés en `\n` — `base.py` les
+      # rétablit. `sync: false` : Render les demande à la création du blueprint
+      # et ne les écrit jamais dans ce fichier.
+      - key: JWT_SIGNING_KEY
+        sync: false
+      - key: JWT_VERIFYING_KEY
+        sync: false
+
+      # ------------------------------------------------------- stockage objet
+      #
+      # Cloudflare R2, compatible S3. Les quatre compartiments sont à créer à la
+      # main dans la console : `ensure_storage_buckets` pose sa politique de
+      # lecture avec `put_bucket_policy`, que R2 n'implémente pas — l'accès
+      # public y passe par un domaine déclaré sur le compartiment. C'est
+      # pourquoi cette commande, présente dans le démarrage du compose, est
+      # absente du `dockerCommand` ci-dessus.
+      - key: S3_ENDPOINT_URL
+        sync: false
+      # R2 n'a pas de régions au sens d'AWS et n'accepte que cette valeur.
+      - key: S3_REGION
+        value: auto
+      - key: S3_ACCESS_KEY
+        sync: false
+      - key: S3_SECRET_KEY
+        sync: false
+      # Vrai, contrairement au MinIO du compose : R2 est joint par l'Internet.
+      - key: S3_USE_SSL
+        value: "True"
+      - key: S3_ADDRESSING_STYLE
+        value: path
+      # Adresse **publique** des compartiments publics — le domaine `r2.dev` du
+      # compartiment ou un domaine propre. Sans elle, les applications reçoivent
+      # des URL d'images pointant sur le point d'accès d'administration, qu'un
+      # téléphone n'ouvrira pas.
+      - key: S3_PUBLIC_URL
+        sync: false
+      - key: S3_BUCKET_PRODUCTS
+        value: elcorazon-products
+      - key: S3_BUCKET_BANNERS
+        value: elcorazon-banners
+      - key: S3_BUCKET_USERS
+        value: elcorazon-users
+      - key: S3_BUCKET_DOCUMENTS
+        value: elcorazon-documents
+      - key: S3_SIGNED_URL_EXPIRE
+        value: "900"
+
+      # ------------------------------------------------------- messagerie
+      #
+      # `prod.py` lit ces quatre variables sans valeur de repli : leur absence
+      # empêche le chargement des réglages, donc le démarrage.
+      - key: EMAIL_HOST
+        sync: false
+      - key: EMAIL_PORT
+        value: "587"
+      - key: EMAIL_HOST_USER
+        sync: false
+      - key: EMAIL_HOST_PASSWORD
+        sync: false
+      - key: DEFAULT_FROM_EMAIL
+        sync: false
+
+      # ------------------------------------------------------- métier
+      - key: DEFAULT_CURRENCY
+        value: XOF
+      - key: COURIER_FEE_SHARE_PERCENT
+        value: "80"
+
+      # ------------------------------------------------- origines autorisées
+      #
+      # Vides tant que le back-office Flutter Web n'est pas déployé. Vide ne
+      # veut pas dire ouvert : `CORS_ALLOW_ALL_ORIGINS` est faux en production,
+      # donc aucun appel navigateur d'une autre origine ne passe. À renseigner
+      # depuis le tableau de bord, avec le schéma (`https://admin.exemple.app`).
+      - key: CORS_ALLOWED_ORIGINS
+        value: ""
+      - key: CSRF_TRUSTED_ORIGINS
+        value: ""
+
+  # Key Value — l'ex-Redis de Render. Porte le cache Django et la couche de
+  # canaux de Channels. Déclaré dans `services` et non dans `databases` : cette
+  # dernière clé est réservée à PostgreSQL.
+  - type: keyvalue
+    name: elcorazon-keyvalue
+    plan: free
+    region: frankfurt
+    # `allkeys-lru` et non `noeviction` : l'offre gratuite plafonne à 25 Mio, et
+    # une instance pleine en `noeviction` refuse toute écriture — le cache
+    # renverrait des erreurs au lieu de simplement manquer sa cible. Réglage à
+    # revoir le jour où Celery arrive : une file de tâches ne doit pas être
+    # évincée, sous peine de perdre des tâches déjà acceptées.
+    maxmemoryPolicy: allkeys-lru
+    # Liste vide : seuls les services de ce compte Render joignent l'instance,
+    # par le réseau privé. Aucune adresse publique.
+    ipAllowList: []
+
+databases:
+  - name: elcorazon-db
+    plan: free
+    region: frankfurt
+    databaseName: elcorazon
+    user: elcorazon
+    postgresMajorVersion: "17"
+    # PostGIS est activé par la migration `geography/0000_postgis`, et non par un
+    # `CREATE EXTENSION` lancé à la main : la base gratuite expire au bout d'un
+    # mois et devra être recréée. Une étape manuelle se saute — celle-là se
+    # serait sautée le jour où plus personne ne se souvient qu'elle existe.
+    ipAllowList: []

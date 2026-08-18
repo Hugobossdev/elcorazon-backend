@@ -7,7 +7,7 @@ tourne avec une configuration dégradée sans que personne ne le sache.
 
 from __future__ import annotations
 
-from decouple import config
+from decouple import Csv, config
 
 from .base import *  # noqa: F403
 
@@ -36,7 +36,14 @@ SESSION_COOKIE_SECURE = True
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = "Lax"
 CSRF_COOKIE_SECURE = True
-CSRF_TRUSTED_ORIGINS = config("CSRF_TRUSTED_ORIGINS", default="", cast=lambda v: v.split(","))
+# `Csv()` et non `str.split(",")` : sur une variable absente ou vide, le split
+# rend `[""]` — une liste d'une origine vide, pas une liste vide. Django refuse
+# alors de démarrer (`4_0.E001` : une origine doit porter un schéma), et
+# django-cors-headers fait de même sur son propre réglage (`corsheaders.E013`).
+# Le déploiement échouait donc au démarrage tant que le back-office n'avait pas
+# d'adresse à déclarer. `Csv()` écarte les segments vides et rend `[]`, ce qui
+# n'ouvre rien : les deux listes sont des autorisations, pas des filtres.
+CSRF_TRUSTED_ORIGINS = config("CSRF_TRUSTED_ORIGINS", default="", cast=Csv())
 
 X_FRAME_OPTIONS = "DENY"
 
@@ -66,7 +73,7 @@ STORAGES = {
 # --------------------------------------------------------------- CORS
 
 CORS_ALLOW_ALL_ORIGINS = False
-CORS_ALLOWED_ORIGINS = config("CORS_ALLOWED_ORIGINS", default="", cast=lambda v: v.split(","))
+CORS_ALLOWED_ORIGINS = config("CORS_ALLOWED_ORIGINS", default="", cast=Csv())
 
 # --------------------------------------------------------------- messagerie
 

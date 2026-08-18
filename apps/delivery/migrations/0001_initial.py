@@ -11,6 +11,9 @@ class Migration(migrations.Migration):
     initial = True
 
     dependencies = [
+        # PostGIS doit exister avant le premier champ géométrique : sur un
+        # PostgreSQL géré, l'extension n'est pas posée d'avance.
+        ('geography', '0000_postgis'),
     ]
 
     operations = [

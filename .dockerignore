@@ -1,0 +1,21 @@
+# `.venv*` et non `.venv` : un poste porte souvent plusieurs environnements
+# (`.venv313` pour une version précise de Python). Copiés dans l'image, ils
+# l'alourdissent de centaines de mégaoctets et se font analyser par ruff, qui
+# signale alors des erreurs dans du code de dépendance.
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+.git/
+.gitignore
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+staticfiles/
+media/
+*.md

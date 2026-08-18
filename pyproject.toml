@@ -1,0 +1,273 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["config", "common", "apps"]
+
+[project]
+name = "elcorazon-backend"
+version = "2.0.0"
+description = "El Corazón — backend Django de la plateforme de commande et de livraison"
+requires-python = ">=3.13"
+
+dependencies = [
+    "Django==5.2.*",
+    "djangorestframework==3.17.*",
+    "djangorestframework-simplejwt[crypto]==5.*",
+    "django-filter==25.*",
+    "drf-spectacular==0.30.*",
+    "psycopg[binary]==3.3.*",
+    "channels[daphne]==4.3.*",
+    "channels-redis==4.*",
+    "celery==5.6.*",
+    "redis==6.*",
+    "django-redis==6.*",
+    "django-cors-headers==4.*",
+    "django-storages[s3]==1.*",
+    "python-decouple==3.*",
+    # Client HTTP du connecteur PayDunya. `httpx` plutôt que `requests` pour son
+    # transport simulable : le connecteur se teste entièrement hors réseau, ce
+    # qui évite une suite lente, instable, et rouge les jours où le prestataire
+    # l'est.
+    "httpx==0.28.*",
+    # Jetons OAuth du connecteur FCM. L'API v1 n'accepte plus la clé serveur :
+    # il faut signer une assertion avec un compte de service et rafraîchir le
+    # jeton obtenu. C'est exactement le genre de code qu'on n'écrit pas soi-même.
+    "google-auth==2.*",
+    "structlog==25.*",
+    # Requis par ImageField : Django valide le contenu de l'image à
+    # l'enregistrement, ce qui évite qu'un fichier arbitraire renommé en .jpg
+    # atterrisse dans le stockage objet.
+    "Pillow==12.*",
+    # Sert les fichiers statiques depuis le processus applicatif. Sous Compose,
+    # c'est Nginx qui s'en charge et WhiteNoise ne fait rien ; sur un hébergeur
+    # où nous ne posons pas notre propre reverse proxy, c'est lui ou rien — sans
+    # lui, l'admin, l'API navigable de DRF et Swagger arrivent sans CSS.
+    "whitenoise[brotli]==6.*",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.*",
+    "pytest-django==4.*",
+    "pytest-cov==7.*",
+    # Requis par `channels.testing.WebsocketCommunicator`, qui est une API
+    # asynchrone : sans boucle d'événements fournie au test, aucun socket ne
+    # peut être ouvert, donc aucune règle d'autorisation à la connexion ne
+    # peut être vérifiée.
+    "pytest-asyncio==1.*",
+    "factory-boy==3.*",
+    "freezegun==1.*",
+    "ruff==0.14.*",
+    "mypy==1.*",
+    "django-stubs[compatible-mypy]==5.*",
+    "djangorestframework-stubs==3.*",
+    # Fournit les DLL GDAL et GEOS aux postes Windows, qui n'ont pas de
+    # gestionnaire de paquets pour les installer (voir config/geolibs.py).
+    # Inutile sous Linux et en conteneur, où elles viennent du système.
+    "pyogrio==0.13.*; sys_platform == 'win32'",
+]
+
+# ---------------------------------------------------------------- pytest
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings.test"
+python_files = ["test_*.py"]
+testpaths = ["tests"]
+# `--ds` **en plus** de la clé ci-dessus, et ce n'est pas une redondance :
+# pytest-django classe ses sources par priorité décroissante — ligne de
+# commande, puis variable d'environnement, puis option ini. Or le service `api`
+# de `docker compose` exporte `DJANGO_SETTINGS_MODULE=config.settings.dev` pour
+# servir l'application, si bien que la commande documentée
+# (`docker compose run --rm api pytest`) exécutait la suite entière sur les
+# réglages de développement : limitation de débit active, cache Redis partagé
+# avec l'instance qui tourne, stockage objet réel, clés JWT du conteneur. Huit
+# tests d'authentification tombaient en 429 pour cette seule raison, alors que
+# la CI — qui pose la variable sur `config.settings.test` — restait verte.
+#
+# `addopts` compte comme ligne de commande : ce drapeau reprend donc la main sur
+# l'environnement ambiant, quel qu'il soit. Un `--ds` passé explicitement à
+# l'invocation le remplace toujours, l'échappatoire reste ouverte.
+addopts = "--strict-markers --strict-config -ra --ds=config.settings.test"
+# Les tests WebSocket sont asynchrones et le déclarent par `@pytest.mark.asyncio`.
+# Mode explicite plutôt qu'`auto` : un test synchrone accidentellement traité
+# comme une coroutine passerait sans rien exécuter — vert et vide.
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    # La CI dispose de PostGIS et de Redis ; un poste de développement sans
+    # Docker n'en a pas. Ces marqueurs permettent d'exécuter localement le
+    # sous-ensemble qui n'en dépend pas :  pytest -m "not postgis and not redis"
+    "postgis: nécessite PostgreSQL avec l'extension PostGIS",
+    "redis: nécessite un serveur Redis",
+    "contract: vérifie le contrat d'API exposé aux clients",
+    "architecture: vérifie une règle d'architecture (dépendances, couches)",
+]
+
+# ---------------------------------------------------------------- ruff
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+# `.venv*` : ruff exclut `.venv` d'office, mais pas `.venv313` ni les autres
+# variantes qu'on crée pour épingler une version de Python. Sans cette ligne,
+# `ruff check .` sur un poste rapporte les erreurs des dépendances installées.
+extend-exclude = ["*/migrations/*", ".venv*"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "N",         # pep8-naming
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "C4",        # comprehensions
+    "DJ",        # flake8-django
+    "S",         # bandit
+    "RUF",
+]
+ignore = [
+    "S101",  # assert : légitime dans les tests et les invariants internes
+
+    # Les exceptions métier portent un nom issu du vocabulaire du domaine, pas
+    # un suffixe technique : `IllegalTransition`, `CurrencyMismatch`,
+    # `InsufficientStock`. Sur un site d'appel, `except InsufficientStock` se
+    # lit mieux que `except InsufficientStockError`, et le domaine prime ici
+    # sur la convention.
+    "N818",
+
+    # Le code, la documentation et les libellés affichés sont en français et
+    # emploient des caractères typographiques (×, —, –, …). Ce ne sont pas des
+    # ambiguïtés à corriger : ce sont les bons caractères. RUF001 couvre les
+    # chaînes, dont les libellés vus par l'utilisateur.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]  # mots de passe en dur : ce sont des fixtures
+
+# RUF012 réclame `ClassVar` sur les attributs de classe mutables. C'est juste en
+# général, et faux sur `class Meta` de Django : le framework y attend des listes
+# nues (`ordering`, `indexes`, `constraints`) et les annoter n'apporte aucune
+# sécurité — Meta n'est jamais instanciée. L'ignorer ici évite d'ajouter du bruit
+# à chaque modèle. Ailleurs dans le code, la règle reste active : `User.objects`
+# et `REQUIRED_FIELDS` sont bien annotés `ClassVar`.
+"apps/*/models.py" = ["RUF012"]
+
+# Même raisonnement pour DRF : `class Meta` d'un sérialiseur (`fields`,
+# `read_only_fields`) et la configuration de vue (`permission_classes`,
+# `throttle_classes`) sont de la déclaration, jamais mutée à l'exécution. Les
+# annoter `ClassVar` les ferait en plus diverger des stubs DRF, qui les
+# déclarent en attributs d'instance — mypy refuserait la redéfinition.
+"apps/*/serializers.py" = ["RUF012"]
+"apps/*/views.py" = ["RUF012"]
+
+# Et pour l'admin : `prepopulated_fields`, `fieldsets`, `list_display` sont lus
+# une fois au chargement et jamais mutés. Django les attend en structures nues.
+"apps/*/admin.py" = ["RUF012"]
+"common/admin.py" = ["RUF012"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["config", "common", "apps"]
+
+# ---------------------------------------------------------------- mypy
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+plugins = ["mypy_django_plugin.main", "mypy_drf_plugin.main"]
+exclude = ["migrations/"]
+
+[[tool.mypy.overrides]]
+module = ["*.migrations.*"]
+ignore_errors = true
+
+# Dépendances sans annotations ni `py.typed`. Les déclarer ici plutôt que de
+# semer des `# type: ignore` sur chaque import : la liste des bibliothèques non
+# typées reste lisible d'un coup d'œil, et le jour où l'une d'elles publie ses
+# annotations, il suffit de retirer une ligne.
+[[tool.mypy.overrides]]
+module = [
+    "boto3",
+    "boto3.*",
+    "botocore",
+    "botocore.*",
+    "celery",
+    "celery.*",
+    "channels",
+    "channels.*",
+    "decouple",
+    "decouple.*",
+    "django_filters",
+    "django_filters.*",
+    "pyogrio",
+    "pyogrio.*",
+    "storages",
+    "storages.*",
+]
+ignore_missing_imports = true
+
+# `django-storages` ne publie pas d'annotations : `S3Storage` est vu comme
+# `Any`, et en hériter est refusé en mode strict. Même traitement que pour les
+# consommateurs Channels, et même limite — l'assouplissement ne couvre que le
+# module qui touche à la bibliothèque, jamais ses appelants.
+[[tool.mypy.overrides]]
+module = ["common.storage"]
+disallow_subclassing_any = false
+
+# Les consommateurs WebSocket héritent et se décorent avec Channels, qui ne
+# publie pas d'annotations : la classe de base et `database_sync_to_async` sont
+# vus comme `Any`, ce que le mode strict refuse par principe. L'assouplissement
+# est **limité à ces modules** — le reste du code, y compris la logique métier
+# qu'ils appellent, reste vérifié strictement.
+[[tool.mypy.overrides]]
+module = ["common.consumers", "apps.*.consumers"]
+disallow_subclassing_any = false
+disallow_untyped_decorators = false
+warn_return_any = false
+
+# Même raison pour les tâches : `celery.shared_task` n'est pas annoté, donc
+# toute fonction qu'il décore est vue comme non typée. Le corps des tâches,
+# lui, reste vérifié.
+[[tool.mypy.overrides]]
+module = ["apps.*.tasks"]
+disallow_untyped_decorators = false
+
+# `django-filter` ne publie pas non plus d'annotations : `FilterSet` est vu
+# comme `Any`, et en hériter est refusé en mode strict. Même traitement, même
+# limite — seuls les modules de filtres sont assouplis.
+[[tool.mypy.overrides]]
+module = ["apps.*.filters"]
+disallow_subclassing_any = false
+
+# L'admin, enfin : les stubs de django-stubs rendent `ModelAdmin` et
+# `TabularInline` génériques, mais Django ne les rend pas indiçables à
+# l'exécution — `ModelAdmin[Order]` en classe de base lève un `TypeError` au
+# démarrage. On ne peut donc pas satisfaire `disallow_any_generics` ici sans
+# casser le serveur. Le reste du module, corps des actions compris, est vérifié.
+[[tool.mypy.overrides]]
+module = ["apps.*.admin", "common.admin"]
+disallow_any_generics = false
+
+[tool.django-stubs]
+django_settings_module = "config.settings.test"
+
+# ---------------------------------------------------------------- coverage
+
+[tool.coverage.run]
+source = ["common", "apps"]
+omit = ["*/migrations/*", "*/tests/*", "*/apps.py"]
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]
+
+# Plancher bloquant. Posé sous la couverture réelle (95 %) et non à son niveau :
+# un seuil collé à la mesure du jour transforme chaque branche nouvelle en
+# échec de construction, et la première réaction est de baisser le seuil — ce
+# qui le vide de son sens. Trois points d'écart laissent passer le bruit et
+# arrêtent une vraie régression.
+fail_under = 92

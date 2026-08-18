@@ -1,0 +1,34 @@
+# Environnement
+.env
+.env.*
+!.env.example
+!.env.prod.example
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Django
+staticfiles/
+media/
+.pytest-media/
+*.log
+
+# Celery — planificateur local, régénéré au démarrage du beat
+celerybeat-schedule*
+
+# Secrets — aucune clé ne doit jamais entrer dans le dépôt
+*.pem
+*.key
+!deploy/**/*.example
+
+# Clés locales : générées par développeur, jamais partagées
+secrets/

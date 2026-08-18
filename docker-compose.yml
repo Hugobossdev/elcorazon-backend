@@ -1,0 +1,177 @@
+# Environnement de développement de référence (ADR-001, Phase 8).
+#
+#   docker compose up
+#
+# Il porte PostGIS et Redis, que le poste Windows du projet n'a pas. C'est donc
+# ici — et en CI — que la suite de tests complète s'exécute.
+#
+# Chaque service porte `restart: unless-stopped`, comme en production. Le motif
+# est différent ici : ce n'est pas la disponibilité qu'on vise, c'est de ne pas
+# perdre l'après-midi à chercher une panne réseau côté Flutter alors que Docker
+# Desktop a simplement redémarré sous les pieds du poste. Les conteneurs
+# repartent alors seuls ; un `docker compose stop` explicite, lui, est respecté.
+
+name: elcorazon
+
+services:
+  db:
+    image: postgis/postgis:17-3.5
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-elcorazon}
+      POSTGRES_USER: ${POSTGRES_USER:-elcorazon}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-elcorazon}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"   # 5433 : le poste a déjà un PostgreSQL 17 sur 5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-elcorazon}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly no --save ""
+    # Ni persistance ni sauvegarde : Redis ne porte que du cache, des files et
+    # le channel layer. Rien dont la perte serait un incident métier.
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      target: dev
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py ensure_storage_buckets &&
+             uvicorn config.asgi:application --host 0.0.0.0 --port 8000 --reload"
+    env_file: .env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.dev
+      POSTGRES_HOST: db
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+    volumes:
+      - .:/app          # rechargement à chaud
+      - ./secrets:/run/secrets:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      # Les compartiments sont créés au démarrage, donc le stockage doit
+      # répondre avant l'API — sinon `docker compose up` échoue sur une
+      # installation neuve.
+      minio: {condition: service_healthy}
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      target: dev
+    command: celery -A config worker --loglevel=info --concurrency=2
+    env_file: .env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.dev
+      POSTGRES_HOST: db
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - .:/app
+      - ./secrets:/run/secrets:ro
+    # L'image est commune aux trois rôles (voir Dockerfile) et porte un
+    # `HEALTHCHECK` HTTP taillé pour l'API. Un worker ne sert aucun HTTP : sans
+    # cette redéfinition, il est signalé `unhealthy` en permanence alors qu'il
+    # consomme ses tâches normalement.
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A config inspect ping -d celery@$$HOSTNAME"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+  beat:
+    build:
+      context: .
+      target: dev
+    command: celery -A config beat --loglevel=info
+    env_file: .env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.dev
+      POSTGRES_HOST: db
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - .:/app
+      - ./secrets:/run/secrets:ro
+    # Même motif que le worker, mais `inspect ping` ne conviendrait pas :
+    # l'ordonnanceur n'est pas un worker et ne répond pas au protocole de
+    # contrôle. Ce qui prouve qu'il tourne, c'est qu'il **écrit** : il
+    # sérialise son échéancier à chaque tour de boucle. Un fichier touché
+    # récemment est donc un signe de vie, un fichier figé un beat coincé.
+    #
+    # Le glob est nécessaire : `shelve` s'appuie ici sur SQLite, et ce sont les
+    # fichiers `-wal`/`-shm` qui bougent, pas le fichier de base.
+    #
+    # Dix minutes de fenêtre plutôt que cinq : `beat_max_loop_interval` vaut
+    # 300 s par défaut, une fenêtre collée à cette valeur clignoterait sans
+    # qu'il y ait de panne.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - find /app -maxdepth 1 -name 'celerybeat-schedule*' -newermt '-10 minutes' | grep -q .
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+  # Stockage objet compatible S3 (ADR-011). L'API et la console d'administration
+  # sont exposées séparément : la première est parlée par le backend, la seconde
+  # sert à regarder ce qui a été écrit pendant le développement.
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    volumes:
+      - miniodata:/data
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # console d'administration
+    healthcheck:
+      # `depends_on: service_healthy` en dépend : sans lui, l'API démarre avant
+      # que le serveur n'accepte les requêtes et la création des compartiments
+      # échoue au premier démarrage — celui où personne ne regarde les journaux.
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  miniodata:

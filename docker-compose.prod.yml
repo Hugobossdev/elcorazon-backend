@@ -28,7 +28,7 @@ x-django: &django
     POSTGRES_HOST: db
     REDIS_URL: redis://redis:6379/0
   volumes:
-    - ./secrets:/run/secrets:ro   # clés JWT, montées en lecture seule
+    - ./secrets:/run/secrets:ro   # identifiants FCM, montés en lecture seule
     - media:/app/media
   depends_on:
     db: {condition: service_healthy}

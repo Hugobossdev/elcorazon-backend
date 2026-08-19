@@ -31,14 +31,6 @@ os.environ.setdefault("POSTGRES_DB", "elcorazon")
 os.environ.setdefault("POSTGRES_USER", "elcorazon")
 os.environ.setdefault("POSTGRES_PASSWORD", "elcorazon")
 
-# `.env` pointe les clés JWT vers `/run/secrets/`, chemin qui n'existe que dans
-# le conteneur.  Sans cette neutralisation, l'import de `base` échoue sur un
-# poste de développement avant même que ce module ait pu régénérer sa paire —
-# la suite entière devient alors indémarrable hors Docker.  Affectation directe
-# et non `setdefault` : c'est justement la valeur héritée qu'il faut écraser.
-os.environ["JWT_PRIVATE_KEY_PATH"] = ""
-os.environ["JWT_PUBLIC_KEY_PATH"] = ""
-
 from config.geolibs import discover
 
 from .base import *  # noqa: F403

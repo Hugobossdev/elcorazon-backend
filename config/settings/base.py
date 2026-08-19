@@ -372,31 +372,29 @@ SPECTACULAR_SETTINGS = {
 # --------------------------------------------------------------- JWT (ADR-004)
 
 
-def _read_key(path_var: str, inline_var: str) -> str:
-    """Lit une clé depuis un fichier monté, sinon depuis l'environnement.
+def _read_key(var: str) -> str:
+    r"""Lit une clé PEM depuis l'environnement.
 
-    Le fichier est la voie recommandée : une clé PEM est multiligne, ce que ni
-    `env_file` de Docker Compose ni la plupart des gestionnaires de
-    configuration ne savent porter sans échappement fragile. C'est aussi la
-    forme qu'attendent les `Secret` Kubernetes montés en volume.
+    Une seule voie, la variable. Le fichier monté — `JWT_PRIVATE_KEY_PATH`,
+    `JWT_PUBLIC_KEY_PATH` — a été retiré : aucun des hébergements visés ne monte
+    de volume sur `/run/secrets/`, et ce chemin hérité d'un `.env` de
+    développement a fait échouer deux déploiements d'affilée en désignant un
+    fichier qui n'existait pas. Une seule voie, c'est une seule chose à vérifier
+    le jour où une clé manque.
 
-    La variable en clair reste acceptée pour les déploiements simples.
+    Les deux écritures d'un PEM multiligne sont acceptées, et c'est ce qui rend
+    la variable suffisante :
 
-    Le chemin ne l'emporte que si le fichier existe **vraiment**. Un hébergeur
-    qui ne monte aucun volume — Render, Fly, Heroku — ne porte la clé que dans
-    une variable ; un `JWT_PRIVATE_KEY_PATH` hérité d'un `.env` de développement
-    y faisait alors échouer l'import des réglages sur un `FileNotFoundError`,
-    donc le démarrage entier, alors que la clé était bien présente sous l'autre
-    forme. Un fichier absent n'est pas une panne : c'est l'autre voie qui prend
-    la main. L'absence des deux, elle, reste fatale — c'est le garde-fou de
-    `prod.py` qui la signale, en nommant la variable à renseigner.
+      — le texte tel quel, sur plusieurs lignes, que le tableau de bord de Render
+        et un `Secret` Kubernetes transportent sans dommage ;
+      — la même clé repliée sur une ligne, sauts de ligne échappés en `\n` —
+        seule forme qu'un `env_file` de Docker Compose sait porter.
+
+    Une clé absente rend la chaîne vide plutôt que de lever : c'est `prod.py` qui
+    tranche, parce que lui seul sait que l'absence y est fatale — en test la paire
+    est régénérée, et `dev.py` n'a pas à refuser de démarrer pour autant.
     """
-    path = config(path_var, default="")
-    if path:
-        key_file = Path(path)
-        if key_file.is_file():
-            return key_file.read_text(encoding="utf-8")
-    return str(config(inline_var, default="")).replace("\\n", "\n")
+    return str(config(var, default="")).replace("\\n", "\n")
 
 
 SIMPLE_JWT = {
@@ -406,8 +404,8 @@ SIMPLE_JWT = {
     "BLACKLIST_AFTER_ROTATION": True,
     "UPDATE_LAST_LOGIN": True,
     "ALGORITHM": "RS256",
-    "SIGNING_KEY": _read_key("JWT_PRIVATE_KEY_PATH", "JWT_SIGNING_KEY"),
-    "VERIFYING_KEY": _read_key("JWT_PUBLIC_KEY_PATH", "JWT_VERIFYING_KEY"),
+    "SIGNING_KEY": _read_key("JWT_SIGNING_KEY"),
+    "VERIFYING_KEY": _read_key("JWT_VERIFYING_KEY"),
     "AUTH_HEADER_TYPES": ("Bearer",),
     "USER_ID_FIELD": "id",
     "USER_ID_CLAIM": "sub",

@@ -34,8 +34,8 @@ services:
     autoDeployTrigger: commit
 
     # Aucun `dockerCommand` : la séquence de démarrage — migrations, fichiers
-    # statiques, compte d'exploitation, puis uvicorn — est le `CMD` de l'image,
-    # dans `deploy/start-api.sh`.
+    # statiques, compte d'exploitation, données de démonstration, puis uvicorn —
+    # est le `CMD` de l'image, dans `deploy/start-api.sh`.
     #
     # Elle y a été déplacée après une panne : `dockerCommand` n'est appliqué
     # qu'aux services **créés par ce blueprint**. Un service créé à la main
@@ -125,6 +125,19 @@ services:
         sync: false
       - key: DJANGO_SUPERUSER_FULL_NAME
         sync: false
+
+      # ------------------------------------------------------- données de démo
+      #
+      # Les migrations créent les tables, jamais leur contenu : sans cette
+      # variable, le catalogue répond 200 sur une liste vide et l'application
+      # affiche une carte blanche. `start-api.sh` pose alors l'établissement de
+      # Lomé puis ses cinquante articles, sans photos.
+      #
+      # À retirer le jour où ce déploiement porte de vraies données : le seed
+      # est idempotent et ne réécrit rien, mais garder la variable revient à
+      # laisser une carte de démonstration se reposer à chaque redémarrage.
+      - key: SEED_DEMO_DATA
+        value: "true"
 
       # ------------------------------------------------------- JWT (ADR-004)
       #

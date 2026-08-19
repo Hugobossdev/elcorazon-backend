@@ -44,6 +44,13 @@ services:
     # sur une base vide en répondant 200 à `/health/` — qui n'accède pas à la
     # base — et 500 à tout le reste.
     #
+    # **Panne corrigée, et à ne pas confondre** avec celle du cache : vue de
+    # l'extérieur, celle-ci a la même allure (200 sur `/health/`, 500 ailleurs)
+    # mais elle épargne les routes protégées, qui répondent 401 — DRF vérifie
+    # les permissions avant les quotas, la requête n'atteint jamais le cache.
+    # Un 401 quelque part disculpe donc la base ; un statique qui répond la
+    # disculpe tout à fait, `collectstatic` suivant `migrate` sous `set -e`.
+    #
     # Le blueprint ne redit donc pas ce que l'image sait déjà faire : une
     # commande écrite à deux endroits finit par diverger, et c'est la copie
     # oubliée qui s'exécute.
@@ -212,9 +219,16 @@ services:
       # ------------------------------------------------- origines autorisées
       #
       # Vides tant que le back-office Flutter Web n'est pas déployé. Vide ne
-      # veut pas dire ouvert : `CORS_ALLOW_ALL_ORIGINS` est faux en production,
-      # donc aucun appel navigateur d'une autre origine ne passe. À renseigner
-      # depuis le tableau de bord, avec le schéma (`https://admin.exemple.app`).
+      # veut pas dire ouvert : `CORS_ALLOW_ALL_ORIGINS` est faux en production.
+      # Une seule exception, et elle est délibérée — `prod.py` autorise en repli
+      # les origines `http://localhost:<port>`, faute de quoi aucune des trois
+      # applications Flutter Web ne peut parler à ce déploiement (le service
+      # ayant été créé à la main, il ignore ces `envVars`). Fermer ce repli avec
+      # `CORS_ALLOW_LOCAL_DEV_ORIGINS=False` le jour où une adresse stable est
+      # déclarée ci-dessous — elle est plus étroite, et suffit.
+      #
+      # À renseigner depuis le tableau de bord, avec le schéma
+      # (`https://admin.exemple.app`).
       - key: CORS_ALLOWED_ORIGINS
         value: ""
       - key: CSRF_TRUSTED_ORIGINS

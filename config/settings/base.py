@@ -381,10 +381,21 @@ def _read_key(path_var: str, inline_var: str) -> str:
     forme qu'attendent les `Secret` Kubernetes montés en volume.
 
     La variable en clair reste acceptée pour les déploiements simples.
+
+    Le chemin ne l'emporte que si le fichier existe **vraiment**. Un hébergeur
+    qui ne monte aucun volume — Render, Fly, Heroku — ne porte la clé que dans
+    une variable ; un `JWT_PRIVATE_KEY_PATH` hérité d'un `.env` de développement
+    y faisait alors échouer l'import des réglages sur un `FileNotFoundError`,
+    donc le démarrage entier, alors que la clé était bien présente sous l'autre
+    forme. Un fichier absent n'est pas une panne : c'est l'autre voie qui prend
+    la main. L'absence des deux, elle, reste fatale — c'est le garde-fou de
+    `prod.py` qui la signale, en nommant la variable à renseigner.
     """
     path = config(path_var, default="")
     if path:
-        return Path(path).read_text(encoding="utf-8")
+        key_file = Path(path)
+        if key_file.is_file():
+            return key_file.read_text(encoding="utf-8")
     return str(config(inline_var, default="")).replace("\\n", "\n")
 
 

@@ -90,9 +90,27 @@ DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL")
 # Ces réglages n'ont pas de valeur par défaut acceptable en production.  Les
 # lire ici, au chargement, transforme un oubli de configuration en échec de
 # démarrage immédiat plutôt qu'en incident de sécurité découvert plus tard.
-for _required in ("DJANGO_SECRET_KEY", "JWT_SIGNING_KEY", "JWT_VERIFYING_KEY", "POSTGRES_PASSWORD"):
+for _required in ("DJANGO_SECRET_KEY", "POSTGRES_PASSWORD"):
     if not config(_required, default=""):
         raise RuntimeError(
             f"{_required} est absente de l'environnement. "
+            "La production ne démarre pas sans configuration complète."
+        )
+
+# Les clés JWT se contrôlent sur leur valeur **résolue**, et non sur la variable
+# en clair : `base.py` les accepte sous deux formes — un fichier monté
+# (`JWT_PRIVATE_KEY_PATH`, la voie du compose et de Kubernetes) ou la variable
+# elle-même (`JWT_SIGNING_KEY`, la voie des hébergeurs sans volume). N'exiger
+# que la seconde refusait de démarrer un déploiement dont les clés étaient bien
+# là, sous l'autre forme — c'était le cas de `docker-compose.prod.yml`, qui ne
+# renseigne que les chemins.
+for _inline, _path, _key in (
+    ("JWT_SIGNING_KEY", "JWT_PRIVATE_KEY_PATH", SIMPLE_JWT["SIGNING_KEY"]),  # noqa: F405
+    ("JWT_VERIFYING_KEY", "JWT_PUBLIC_KEY_PATH", SIMPLE_JWT["VERIFYING_KEY"]),  # noqa: F405
+):
+    if not _key:
+        raise RuntimeError(
+            f"Aucune clé JWT trouvée : {_inline} est absente de l'environnement "
+            f"et {_path} ne désigne aucun fichier lisible. "
             "La production ne démarre pas sans configuration complète."
         )

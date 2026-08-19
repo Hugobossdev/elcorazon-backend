@@ -80,11 +80,20 @@ USER corazon
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
-    CMD curl -fsS http://localhost:8000/health/ || exit 1
+    CMD curl -fsS "http://localhost:${PORT:-8000}/health/" || exit 1
 
 # Rôle par défaut : l'API. Les autres sont choisis par `command:` dans compose
 # ou par l'`args` du déploiement Kubernetes.
-CMD ["uvicorn", "config.asgi:application", "--host", "0.0.0.0", "--port", "8000"]
+#
+# Un script plutôt qu'un appel direct à uvicorn : migrations et fichiers
+# statiques doivent précéder le service, et cette préparation doit voyager avec
+# l'image. Confiée au `dockerCommand` du blueprint Render, elle ne s'appliquait
+# qu'aux services créés par ce blueprint — un service créé à la main depuis le
+# tableau de bord démarrait sur une base sans tables. Voir `deploy/start-api.sh`.
+#
+# `sh <script>` et non `./script` : le bit d'exécution ne survit pas toujours à
+# un dépôt cloné depuis Windows, où il n'existe pas.
+CMD ["sh", "/app/deploy/start-api.sh"]
 
 # ---------------------------------------------------------------- développement
 # Étage supplémentaire portant l'outillage de test et de qualité. C'est la cible

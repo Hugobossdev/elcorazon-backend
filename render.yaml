@@ -18,7 +18,7 @@
 
 services:
   - type: web
-    name: elcorazon-api
+    name: elcorazon-backend
     runtime: docker
     plan: free
     # Francfort est la région la plus proche de l'Afrique de l'Ouest : environ
@@ -33,40 +33,20 @@ services:
     healthCheckPath: /health/
     autoDeployTrigger: commit
 
-    # Migrations et fichiers statiques au démarrage, et non en `preDeployCommand` :
-    # celle-ci est réservée aux offres payantes. Sur une instance unique c'est
-    # équivalent ; le jour où le service passe à plusieurs instances, il faudra
-    # déplacer `migrate` dans un `preDeployCommand` pour qu'il ne s'exécute pas
-    # en parallèle sur chacune.
+    # Aucun `dockerCommand` : la séquence de démarrage — migrations, fichiers
+    # statiques, compte d'exploitation, puis uvicorn — est le `CMD` de l'image,
+    # dans `deploy/start-api.sh`.
     #
-    # `collectstatic` ici et non dans le Dockerfile : `base.py` lit
-    # `DJANGO_SECRET_KEY` à l'import et n'a pas de valeur de repli, donc aucune
-    # commande Django ne s'exécute au moment de la construction de l'image.
+    # Elle y a été déplacée après une panne : `dockerCommand` n'est appliqué
+    # qu'aux services **créés par ce blueprint**. Un service créé à la main
+    # depuis le tableau de bord exécute le `CMD` de l'image et ignore ce
+    # fichier ; les migrations ne passaient donc jamais, et le service tournait
+    # sur une base vide en répondant 200 à `/health/` — qui n'accède pas à la
+    # base — et 500 à tout le reste.
     #
-    # `uvicorn` seul, sans Gunicorn — qui n'est d'ailleurs pas dans les
-    # dépendances : l'offre gratuite alloue 0,1 vCPU et 512 Mio, où un maître
-    # plus un worker ne font que consommer de la mémoire. C'est aussi ce que
-    # fait le `CMD` de l'image.
-    #
-    # `--proxy-headers` est volontairement absent : Django lit
-    # `X-Forwarded-Proto` directement dans les en-têtes
-    # (`SECURE_PROXY_SSL_HEADER`) et DRF lit `X-Forwarded-For` de même
-    # (`NUM_PROXIES`). L'activer ferait dériver `REMOTE_ADDR` d'un en-tête que
-    # le client peut forger, sans rien apporter.
-    # `createsuperuser` est ici parce qu'il ne peut être nulle part ailleurs :
-    # l'offre gratuite n'ouvre ni shell ni SSH, donc il n'existe aucun moyen de
-    # lancer une commande ponctuelle sur l'instance. Sans cette ligne, `/admin/`
-    # serait accessible et définitivement inutilisable, faute d'un compte pour
-    # s'y connecter.
-    #
-    # `|| true` : la commande échoue quand le compte existe déjà, c'est-à-dire à
-    # tous les démarrages sauf le premier. Sans ce garde-fou, l'instance
-    # refuserait de redémarrer à partir du deuxième déploiement.
-    dockerCommand: >-
-      sh -c "python manage.py migrate --noinput &&
-      python manage.py collectstatic --noinput &&
-      (python manage.py createsuperuser --noinput || true) &&
-      exec uvicorn config.asgi:application --host 0.0.0.0 --port ${PORT:-8000}"
+    # Le blueprint ne redit donc pas ce que l'image sait déjà faire : une
+    # commande écrite à deux endroits finit par diverger, et c'est la copie
+    # oubliée qui s'exécute.
 
     envVars:
       - key: DJANGO_SETTINGS_MODULE
@@ -82,7 +62,7 @@ services:
       # variable accepte une liste séparée par des virgules.
       - key: DJANGO_ALLOWED_HOSTS
         fromService:
-          name: elcorazon-api
+          name: elcorazon-backend
           type: web
           property: host
 

@@ -15,6 +15,13 @@ DEBUG = False
 
 # --------------------------------------------------------------- transport
 
+# `base.py` lit `DJANGO_ALLOWED_HOSTS` dans l'environnement, que `render.yaml`
+# renseigne depuis l'hôte du service. Ce repli couvre le service créé à la main
+# depuis le tableau de bord : celui-ci ignore le blueprint, la variable est donc
+# absente et Django répond 400 à toute requête, sonde comprise. Un repli et non
+# une valeur en dur : là où la variable existe, elle reste la source unique.
+ALLOWED_HOSTS = ALLOWED_HOSTS or [".onrender.com"]  # noqa: F405
+
 SECURE_SSL_REDIRECT = True
 SECURE_HSTS_SECONDS = 31_536_000
 SECURE_HSTS_INCLUDE_SUBDOMAINS = True
@@ -44,6 +51,10 @@ CSRF_COOKIE_SECURE = True
 # d'adresse à déclarer. `Csv()` écarte les segments vides et rend `[]`, ce qui
 # n'ouvre rien : les deux listes sont des autorisations, pas des filtres.
 CSRF_TRUSTED_ORIGINS = config("CSRF_TRUSTED_ORIGINS", default="", cast=Csv())
+#
+# Le même repli que pour `ALLOWED_HOSTS`, pour la même raison : sans origine de
+# confiance, la connexion à `/admin/` échoue dès son POST.
+CSRF_TRUSTED_ORIGINS = CSRF_TRUSTED_ORIGINS or ["https://*.onrender.com"]
 
 X_FRAME_OPTIONS = "DENY"
 

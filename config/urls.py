@@ -32,6 +32,33 @@ def healthcheck(_request: HttpRequest) -> JsonResponse:
     return JsonResponse({"status": "ok", "version": settings.SPECTACULAR_SETTINGS["VERSION"]})
 
 
+def index(_request: HttpRequest) -> JsonResponse:
+    """Racine de service.
+
+    Sans elle, `/` répond 404 : c'est correct — aucune route n'y est déclarée —
+    mais c'est la première adresse qu'ouvre quiconque reçoit l'URL du service,
+    et le journal se remplit d'avertissements `Not Found: /` provenant du
+    sondage de l'hébergeur autant que des curieux. Une page d'accueil qui
+    annonce les points d'entrée coûte six lignes et évite de faire croire à une
+    panne là où le service va bien.
+
+    Volontairement sans accès base, comme la sonde : cette réponse doit rester
+    vraie même quand PostgreSQL est indisponible.
+    """
+    return JsonResponse(
+        {
+            "service": "El Corazón — API",
+            "version": settings.SPECTACULAR_SETTINGS["VERSION"],
+            "endpoints": {
+                "health": "/health/",
+                "api": "/api/v1/",
+                "schema": "/api/v1/schema/",
+                "admin": "/admin/",
+            },
+        }
+    )
+
+
 api_v1 = [
     path("auth/", include("apps.accounts.urls")),
     path("administration/", include("apps.accounts.backoffice_urls")),
@@ -58,6 +85,7 @@ api_v1 = [
 ]
 
 urlpatterns = [
+    path("", index, name="index"),
     path("health/", healthcheck, name="health"),
     path("admin/", admin.site.urls),
     path("api/v1/", include((api_v1, "v1"), namespace="v1")),

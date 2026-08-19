@@ -14,6 +14,14 @@ Deux niveaux, et c'est le second qui compte réellement :
 Le second est indexé sur l'identifiant **soumis**, pas sur le compte trouvé :
 compter uniquement les comptes existants révélerait lesquels existent, par
 différence de comportement.
+
+Les deux ferment en 503 quand le cache est injoignable (`FailClosedOnCacheOutage`,
+voir `common.throttling`). Ailleurs le compteur n'est qu'une précaution contre la
+boucle automatisée, et le projet préfère alors laisser passer plutôt que de
+rabattre l'API ; ici le compteur *est* la protection. L'ouvrir pendant une panne
+rendrait la force brute libre exactement quand les journaux sont les moins
+lisibles — et une panne de cache, un attaquant peut la provoquer plutôt que
+l'attendre.
 """
 
 from __future__ import annotations
@@ -25,17 +33,19 @@ from rest_framework.request import Request
 from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
+from common.throttling import FailClosedOnCacheOutage
+
 __all__ = ["AuthIPThrottle", "AuthIdentifierThrottle"]
 
 
-class AuthIPThrottle(SimpleRateThrottle):
+class AuthIPThrottle(FailClosedOnCacheOutage, SimpleRateThrottle):
     scope = "auth_ip"
 
     def get_cache_key(self, request: Request, view: APIView) -> str | None:
         return self.cache_format % {"scope": self.scope, "ident": self.get_ident(request)}
 
 
-class AuthIdentifierThrottle(SimpleRateThrottle):
+class AuthIdentifierThrottle(FailClosedOnCacheOutage, SimpleRateThrottle):
     """Compte les tentatives visant un même identifiant, toutes origines confondues."""
 
     scope = "auth_identifier"

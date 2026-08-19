@@ -204,6 +204,8 @@ module = [
     "decouple.*",
     "django_filters",
     "django_filters.*",
+    "django_redis",
+    "django_redis.*",
     "pyogrio",
     "pyogrio.*",
     "storages",

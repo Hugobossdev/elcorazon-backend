@@ -19,7 +19,7 @@ from rest_framework.permissions import AllowAny, BasePermission
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.serializers import BaseSerializer
-from rest_framework.throttling import AnonRateThrottle, BaseThrottle, UserRateThrottle
+from rest_framework.throttling import BaseThrottle
 from rest_framework.viewsets import GenericViewSet, ReadOnlyModelViewSet
 
 from apps.catalog.filters import MenuItemFilter
@@ -33,7 +33,11 @@ from apps.catalog.serializers import (
 )
 from apps.catalog.services import ReviewService
 from common.permissions import IsCustomer, authenticated_user
-from common.throttling import ReviewWriteThrottle
+from common.throttling import (
+    ResilientAnonRateThrottle,
+    ResilientUserRateThrottle,
+    ReviewWriteThrottle,
+)
 
 __all__ = ["CategoryViewSet", "MenuItemViewSet", "ReviewViewSet"]
 
@@ -62,7 +66,7 @@ class MenuItemViewSet(ReadOnlyModelViewSet[MenuItem]):
     """
 
     permission_classes = [AllowAny]
-    throttle_classes = [AnonRateThrottle, UserRateThrottle]
+    throttle_classes = [ResilientAnonRateThrottle, ResilientUserRateThrottle]
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_class = MenuItemFilter
     search_fields = ["name", "description"]

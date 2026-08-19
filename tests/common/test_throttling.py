@@ -14,23 +14,31 @@ Trois choses se vérifient ici, de nature différente :
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
 from django.core.cache import cache
 from django.urls import reverse
+from redis.exceptions import ConnectionError as RedisConnectionError
 from rest_framework import status
 from rest_framework.settings import api_settings
 from rest_framework.test import APIClient
 from rest_framework.throttling import SimpleRateThrottle
 
 from apps.accounts.models import User
+from apps.accounts.throttling import AuthIdentifierThrottle, AuthIPThrottle
 from apps.catalog.models import MenuItem
 from common.throttling import (
     CartWriteThrottle,
+    FailClosedOnCacheOutage,
+    FailOpenOnCacheOutage,
     OrderCreationThrottle,
     PaymentInitiationThrottle,
+    ResilientAnonRateThrottle,
+    ResilientUserRateThrottle,
     ReviewWriteThrottle,
+    RewardRedemptionThrottle,
     TrackingPingThrottle,
 )
 
@@ -86,7 +94,14 @@ class TestCouverture:
     def test_un_limiteur_s_applique_partout_par_defaut(self) -> None:
         classes = {classe.__name__ for classe in api_settings.DEFAULT_THROTTLE_CLASSES}
 
-        assert classes == {"AnonRateThrottle", "UserRateThrottle"}
+        assert classes == {"ResilientAnonRateThrottle", "ResilientUserRateThrottle"}
+
+    def test_le_socle_par_defaut_ne_tombe_pas_avec_le_cache(self) -> None:
+        """Les classes de DRF laissent remonter l'erreur de connexion en 500
+        depuis `check_throttles`, donc avant la vue : un cache injoignable
+        rabattait toute l'API publique, catalogue compris."""
+        for classe in api_settings.DEFAULT_THROTTLE_CLASSES:
+            assert issubclass(classe, FailOpenOnCacheOutage), classe.__name__
 
     def test_chaque_quota_nomme_a_un_taux(self) -> None:
         """Un `scope` sans taux ne protège rien : DRF lève
@@ -237,3 +252,158 @@ class TestIdentificationDeLAppelant:
             assert throttle.get_ident(requete) != throttle.get_ident(autre)
         finally:
             api_settings.reload()
+
+
+class _CacheInjoignable:
+    """Le cache tel qu'il se comporte quand Redis ne répond plus.
+
+    `django_redis` relaie l'erreur brute de `redis` (`raise e.__cause__`) et pas
+    seulement son enveloppe `ConnectionInterrupted` : c'est cette forme-là qui
+    remontait jusqu'à DRF, donc celle qu'il faut imiter ici.
+    """
+
+    message = "Error 111 connecting to cache:6379. Connection refused."
+
+    def get(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RedisConnectionError(self.message)
+
+    def set(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RedisConnectionError(self.message)
+
+
+@pytest.fixture
+def cache_injoignable(monkeypatch: Any) -> None:
+    """Coupe le cache pour tous les limiteurs, sans toucher au reste.
+
+    `SimpleRateThrottle.cache` est un attribut de classe résolu par héritage :
+    le remplacer là couvre les quatre familles de limiteurs d'un coup.
+    """
+    monkeypatch.setattr(SimpleRateThrottle, "cache", _CacheInjoignable())
+
+
+@pytest.fixture
+def quotas_opposables() -> Any:
+    """Rend les quotas actifs — les réglages de test les neutralisent tous.
+
+    Sans taux, `allow_request` sort sur `rate is None` avant même d'avoir
+    touché au cache : un test de panne passerait alors sans rien démontrer.
+    """
+    classes = (
+        ResilientAnonRateThrottle,
+        ResilientUserRateThrottle,
+        AuthIPThrottle,
+        AuthIdentifierThrottle,
+    )
+    quotas = {classe.scope: "60/min" for classe in classes}
+    anciens = [(c, c.THROTTLE_RATES, getattr(c, "rate", None)) for c in classes]
+
+    for classe in classes:
+        classe.THROTTLE_RATES = quotas
+        classe.rate = None
+
+    yield
+
+    for classe, rates, rate in anciens:
+        classe.THROTTLE_RATES = rates
+        classe.rate = rate
+
+
+class TestPanneDeCache:
+    """Ce qu'un cache injoignable doit faire — et ne plus faire.
+
+    Panne réelle, en production, le 19/08/2026 : `REDIS_URL` portait le nom de
+    service docker-compose `redis`, qui ne résout pas chez l'hébergeur. Tout ce
+    qui franchissait la permission atteignait `check_throttles`, y lisait le
+    cache, et repartait en 500 — carte et catalogue compris. Les routes
+    protégées, elles, mouraient en 401 avant d'y arriver : c'est cette
+    frontière 401/500 qui a désigné le cache plutôt que la base.
+    """
+
+    def test_le_catalogue_reste_lisible(
+        self, menu_item: MenuItem, quotas_opposables: Any, cache_injoignable: None
+    ) -> None:
+        """Le défaut corrigé : la carte tombait avec le compteur."""
+        reponse = APIClient().get(reverse("v1:catalog:item-list"))
+
+        assert reponse.status_code == status.HTTP_200_OK
+
+    def test_l_authentification_refuse_en_503(
+        self, customer: User, quotas_opposables: Any, cache_injoignable: None
+    ) -> None:
+        """Refuser, et non laisser passer : ici le compteur *est* la protection
+        contre la force brute, et une panne de cache, un attaquant peut la
+        provoquer plutôt que l'attendre."""
+        reponse = APIClient().post(
+            reverse("v1:accounts:login"),
+            {"email": customer.email, "password": "peu importe"},
+            format="json",
+        )
+
+        assert reponse.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+
+    def test_le_refus_garde_la_forme_des_autres_erreurs(
+        self, customer: User, quotas_opposables: Any, cache_injoignable: None
+    ) -> None:
+        """RFC 9457 et un `code` stable. Le 503 dit ce que le 500 taisait :
+        l'indisponibilité est passagère, et réessayer est la bonne réponse."""
+        reponse = APIClient().post(
+            reverse("v1:accounts:login"),
+            {"email": customer.email, "password": "peu importe"},
+            format="json",
+        )
+
+        assert reponse["Content-Type"].startswith("application/problem+json")
+        assert reponse.data["code"] == "quota_unavailable"
+
+    def test_la_requete_laissee_passer_est_journalisee(
+        self,
+        menu_item: MenuItem,
+        quotas_opposables: Any,
+        cache_injoignable: None,
+        caplog: Any,
+    ) -> None:
+        """Un quota qui s'efface en silence est un quota qu'on croit encore
+        appliqué. La panne doit rester lisible même quand elle ne casse plus
+        rien."""
+        with caplog.at_level(logging.WARNING, logger="common.throttling"):
+            APIClient().get(reverse("v1:catalog:item-list"))
+
+        assert any("cache injoignable" in message for message in caplog.messages)
+
+
+class TestPolitiqueParClasse:
+    """Chaque limiteur déclare ce qu'il fait sans cache — aucun ne s'abstient.
+
+    Le partage ne suit pas le coût de l'opération mais ce qui reste debout sans
+    le compteur : un catalogue sans quota reste un catalogue lisible, un
+    `/auth/login` sans quota est une porte ouverte.
+    """
+
+    def test_les_quotas_qui_sont_la_seule_protection_ferment(self) -> None:
+        for classe in (
+            AuthIPThrottle,
+            AuthIdentifierThrottle,
+            OrderCreationThrottle,
+            PaymentInitiationThrottle,
+            RewardRedemptionThrottle,
+        ):
+            assert issubclass(classe, FailClosedOnCacheOutage), classe.__name__
+
+    def test_les_quotas_de_precaution_s_effacent(self) -> None:
+        for classe in (
+            ResilientAnonRateThrottle,
+            ResilientUserRateThrottle,
+            CartWriteThrottle,
+            ReviewWriteThrottle,
+            TrackingPingThrottle,
+        ):
+            assert issubclass(classe, FailOpenOnCacheOutage), classe.__name__
+
+    def test_le_webhook_du_prestataire_ne_se_ferme_pas(self) -> None:
+        """Ce qui garde cette route est la signature du prestataire, pas le
+        compteur. La fermer perdrait des confirmations de paiement — donc des
+        commandes payées mais jamais marquées telles — pour protéger une porte
+        déjà fermée à clé."""
+        from apps.payments.views import WebhookView
+
+        assert issubclass(WebhookView.throttle_classes[0], FailOpenOnCacheOutage)

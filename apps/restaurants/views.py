@@ -15,7 +15,6 @@ from django.db.models import QuerySet
 from drf_spectacular.utils import extend_schema
 from rest_framework.permissions import AllowAny
 from rest_framework.serializers import BaseSerializer
-from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
 from rest_framework.viewsets import ReadOnlyModelViewSet
 
 from apps.restaurants.models import Restaurant
@@ -24,6 +23,7 @@ from apps.restaurants.serializers import (
     RestaurantDetailSerializer,
     RestaurantSerializer,
 )
+from common.throttling import ResilientAnonRateThrottle, ResilientUserRateThrottle
 
 __all__ = ["RestaurantViewSet"]
 
@@ -47,7 +47,7 @@ class RestaurantViewSet(ReadOnlyModelViewSet[Restaurant]):
     """
 
     permission_classes = [AllowAny]
-    throttle_classes = [AnonRateThrottle, UserRateThrottle]
+    throttle_classes = [ResilientAnonRateThrottle, ResilientUserRateThrottle]
     lookup_field = "slug"
     filterset_fields = {
         "zone__city__slug": ["exact"],

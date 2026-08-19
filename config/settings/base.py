@@ -290,9 +290,16 @@ REST_FRAMEWORK = {
     #
     # Une vue qui déclare `throttle_classes` remplace ce défaut : c'est ainsi
     # que l'authentification et le webhook gardent leurs quotas propres.
+    #
+    # Les variantes `Resilient…` et non celles de DRF : le compteur vit dans le
+    # cache, et les classes d'origine laissent remonter une erreur de connexion
+    # en 500 depuis `check_throttles`, c'est-à-dire avant la vue. Un cache
+    # injoignable rabattait ainsi toute l'API publique — celle qui n'a pas de
+    # permission pour mourir plus tôt. Elles laissent désormais passer sans
+    # compter, en le journalisant. Voir `common.throttling`.
     "DEFAULT_THROTTLE_CLASSES": [
-        "rest_framework.throttling.AnonRateThrottle",
-        "rest_framework.throttling.UserRateThrottle",
+        "common.throttling.ResilientAnonRateThrottle",
+        "common.throttling.ResilientUserRateThrottle",
     ],
     "DEFAULT_THROTTLE_RATES": {
         # Socle : lecture de catalogue, consultation d'historique.

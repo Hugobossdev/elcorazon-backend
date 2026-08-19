@@ -21,7 +21,6 @@ from rest_framework.generics import get_object_or_404
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
-from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework.viewsets import ReadOnlyModelViewSet
 
@@ -53,7 +52,11 @@ from apps.payments.services import PaymentService, RefundService, WithdrawalServ
 from apps.payments.split import ParticipantInput, SplitService
 from apps.restaurants.scoping import is_unscoped, staff_restaurant_ids
 from common.permissions import HasPermission, IsCourier, IsCustomer, authenticated_user
-from common.throttling import PaymentInitiationThrottle
+from common.throttling import (
+    PaymentInitiationThrottle,
+    ResilientScopedRateThrottle,
+    StrictScopedRateThrottle,
+)
 
 __all__ = [
     "InitiatePaymentView",
@@ -130,7 +133,12 @@ class WebhookView(APIView):
 
     permission_classes = [AllowAny]
     authentication_classes: list[type[Any]] = []
-    throttle_classes = [ScopedRateThrottle]
+    # Ouvert si le cache tombe, contrairement au reste de `payments` : ce qui
+    # garde cette route est la **signature** du prestataire, pas le compteur.
+    # Refuser ici perdrait des confirmations de paiement — donc des commandes
+    # payées mais jamais marquées telles — pour protéger une porte qu'une
+    # signature ferme déjà.
+    throttle_classes = [ResilientScopedRateThrottle]
     throttle_scope = "webhook"
 
     @extend_schema(
@@ -246,7 +254,11 @@ class ShareView(APIView):
     """
 
     permission_classes = [AllowAny]
-    throttle_classes = [ScopedRateThrottle]
+    # Fermé si le cache tombe : sans authentification, le seul justificatif est
+    # un jeton, et le quota est ce qui rend son énumération impraticable. Le
+    # jeton est long et aléatoire, mais c'est une raison de le garder difficile
+    # à deviner, pas de laisser essayer sans compter.
+    throttle_classes = [StrictScopedRateThrottle]
     throttle_scope = "share_access"
 
     @extend_schema(responses={200: SplitShareSerializer}, tags=["payments"])

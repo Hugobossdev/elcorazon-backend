@@ -17,7 +17,6 @@ from drf_spectacular.utils import extend_schema
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
-from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
 from rest_framework.views import APIView
 from rest_framework.viewsets import ReadOnlyModelViewSet
 
@@ -29,6 +28,7 @@ from apps.geography.serializers import (
     ZoneResolutionQuerySerializer,
     ZoneResolutionSerializer,
 )
+from common.throttling import ResilientAnonRateThrottle, ResilientUserRateThrottle
 
 __all__ = ["CityViewSet", "CountryViewSet", "ZoneResolutionView"]
 
@@ -82,7 +82,7 @@ class ZoneResolutionView(APIView):
     """
 
     permission_classes = [AllowAny]
-    throttle_classes = [AnonRateThrottle, UserRateThrottle]
+    throttle_classes = [ResilientAnonRateThrottle, ResilientUserRateThrottle]
 
     @extend_schema(
         parameters=[ZoneResolutionQuerySerializer],

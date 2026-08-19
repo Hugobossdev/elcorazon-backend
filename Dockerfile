@@ -75,6 +75,18 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Utilisateur non privilégié : un conteneur compromis ne doit pas être root.
 RUN useradd --create-home --uid 10001 corazon
 COPY --chown=corazon:corazon . /app
+
+# `/app` appartient à root : il est créé par le `WORKDIR` de l'étage de base,
+# avant même que l'utilisateur existe, et le `--chown` du `COPY` ne s'applique
+# qu'aux fichiers copiés, pas au répertoire qui les porte. Or `staticfiles/` est
+# dans `.dockerignore` — il n'arrive donc jamais par la copie — et
+# `collectstatic` le crée au démarrage, sous l'identité de `corazon` :
+# `PermissionError` au premier déploiement où les migrations sont enfin passées.
+#
+# Seul ce répertoire change de propriétaire, et non `/app` tout entier : le
+# processus n'a aucune raison de pouvoir réécrire son propre code.
+RUN mkdir -p /app/staticfiles && chown corazon:corazon /app/staticfiles
+
 USER corazon
 
 EXPOSE 8000

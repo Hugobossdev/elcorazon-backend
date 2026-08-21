@@ -58,11 +58,13 @@ fi
 # s'endormant après quinze minutes.
 #
 # Sans `--with-images` : les photos se téléchargent depuis des hébergeurs tiers
-# et se déposent dans le compartiment `products`. Au démarrage, cela allongerait
-# le boot de plusieurs minutes et ferait dépendre la mise en service de la
+# et se déposent dans le dossier `products`. Au démarrage, cela allongerait le
+# boot de plusieurs minutes et ferait dépendre la mise en service de la
 # disponibilité d'un CDN — pour un déploiement qui n'a pas nécessairement de
-# stockage objet configuré (`S3_*` est en `sync: false`). La carte s'affiche donc
-# sans photos ; les ajouter est un `--with-images` le jour où R2 est branché.
+# stockage objet configuré (`CLOUDINARY_*` est en `sync: false`). Le
+# téléchargement reste donc l'affaire d'un poste de développement, une fois pour
+# toutes ; `attach_product_images`, plus bas, se charge d'en faire profiter cet
+# environnement-ci sans rien retélécharger.
 #
 # Pas de `|| true`, contrairement au compte ci-dessus : `set -e` s'applique. Un
 # échec ici n'est pas un état attendu comme l'est un compte déjà créé, c'est un
@@ -71,6 +73,22 @@ fi
 if [ "${SEED_DEMO_DATA:-}" = "true" ]; then
     python manage.py seed_reference_data
     python manage.py seed_full_catalog
+
+    # Les photos ne sont pas téléchargées ici, mais elles sont déjà sur le
+    # stockage objet : le compte Cloudinary est le même pour tous les
+    # environnements. Cette commande ne fait que poser le lien manquant entre la
+    # ligne et l'objet — elle n'envoie aucun octet, et ne renseigne une colonne
+    # qu'après avoir vérifié auprès du fournisseur que le fichier existe.
+    #
+    # Sa place est dans ce bloc et non après le `fi` : ce sont les photos de la
+    # carte de démonstration. Les slugs d'une exploitation réelle ne désignent
+    # aucun de ces fichiers — la commande n'y écrirait rien, mais interrogerait
+    # quand même le fournisseur article par article.
+    #
+    # Pas de `|| true` : elle ne lève pas sur un fournisseur injoignable, elle
+    # le signale et laisse la carte sans photos, que le redémarrage suivant
+    # rattrapera. Un échec qui remonte jusqu'ici est donc une vraie anomalie.
+    python manage.py attach_product_images
 fi
 
 # `exec` : uvicorn remplace le shell et devient le PID 1. Sans lui, les signaux

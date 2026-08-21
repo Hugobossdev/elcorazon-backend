@@ -18,7 +18,7 @@ docker compose up
 
 - API : <http://localhost:8000>
 - Documentation OpenAPI : <http://localhost:8000/api/v1/docs/>
-- Console MinIO : <http://localhost:9001>
+- Stockage objet : Cloudinary (tableau de bord sur <https://cloudinary.com/console>)
 
 PostgreSQL est exposé sur **5433** et non 5432, pour ne pas entrer en conflit
 avec une instance déjà installée sur le poste.

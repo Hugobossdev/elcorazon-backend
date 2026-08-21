@@ -65,9 +65,18 @@ if ! $BASE_SEULE; then
 
   ARCHIVE_MEDIA="$DESTINATION/minio-$HORODATAGE.tar.gz"
 
-  # Le stockage porte les pièces justificatives des livreurs et les images du
-  # catalogue. Les perdre ne casse pas le service mais oblige chaque livreur à
-  # redéposer son dossier.
+  # ⚠ TRANSITOIRE — depuis le passage à Cloudinary (ADR-011), les fichiers
+  # déposés ne sont plus ici : c'est le fournisseur qui les héberge et les
+  # réplique. Ce volume ne contient que ce qui a été écrit **avant** la bascule,
+  # et il n'a plus vocation à grossir.
+  #
+  # Le sauvegarder reste utile tant que `migrate_media_to_cloudinary` n'a pas
+  # été passée : ces octets sont alors la seule copie des pièces justificatives
+  # des livreurs et des images du catalogue. Les perdre ne casse pas le service
+  # mais oblige chaque livreur à redéposer son dossier.
+  #
+  # Une fois la migration faite et vérifiée, supprimer cette section — et le
+  # volume avec.
   docker run --rm \
     -v elcorazon-prod_miniodata:/data:ro \
     -v "$(pwd)/$DESTINATION:/sauvegarde" \

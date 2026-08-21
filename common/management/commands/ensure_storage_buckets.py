@@ -1,30 +1,49 @@
-"""Crée les compartiments de stockage manquants et pose leur politique.
+"""Vérifie la configuration du stockage objet et récapitule les dossiers.
 
 Appelée au démarrage de l'environnement de développement (`docker compose`) et
-lors d'un déploiement. Idempotente : la seconde exécution ne fait rien, ce qui
-permet de la mettre inconditionnellement dans une commande de démarrage plutôt
-que de la documenter comme une étape manuelle — les étapes manuelles se sautent.
+lors d'un déploiement. Idempotente, et désormais **sans effet de bord** : chez
+Cloudinary il n'y a rien à provisionner.
 
     python manage.py ensure_storage_buckets
+
+## Pourquoi la garder alors qu'elle ne crée plus rien
+
+Deux raisons, et la seconde est la vraie.
+
+D'abord parce qu'elle est câblée dans `docker-compose.yml` et
+`docker-compose.prod.yml` : la retirer ferait échouer deux séquences de
+démarrage pour un gain nul.
+
+Ensuite parce qu'elle a changé de métier sans changer d'utilité. Du temps de S3,
+elle créait les compartiments et posait leur politique de lecture — une étape de
+provisionnement. Chez Cloudinary, un dossier n'est qu'un préfixe dans
+l'identifiant d'une ressource : il naît au premier dépôt, et la visibilité est
+portée par chaque objet via son type de livraison, décidé à l'envoi. Il ne reste
+donc rien à créer, mais il reste quelque chose à **vérifier** : que le compte est
+configuré. Sans les trois identifiants, tout envoi de fichier échouera à
+l'exécution, sur une erreur d'authentification que personne ne rapproche d'une
+variable oubliée. Le dire au démarrage vaut mieux que de le laisser découvrir au
+premier utilisateur qui envoie un avatar.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
 from common.storage import PRIVATE_BUCKETS, PUBLIC_BUCKETS, StorageService, bucket_name
 
 
 class Command(BaseCommand):
-    help = "Crée les compartiments de stockage objet et applique leur politique de lecture."
+    help = "Vérifie la configuration Cloudinary et récapitule les dossiers de stockage."
 
     def add_arguments(self, parser: Any) -> None:
         parser.add_argument(
             "--dry-run",
             action="store_true",
-            help="Montre ce qui serait fait, sans rien créer.",
+            help="Montre les dossiers, sans vérifier la configuration.",
         )
 
     def handle(self, *args: object, **options: Any) -> None:
@@ -32,30 +51,33 @@ class Command(BaseCommand):
             self._annoncer()
             return
 
+        manquantes = [
+            nom
+            for nom in ("CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET")
+            if not getattr(settings, nom, "")
+        ]
+        if manquantes:
+            # Échouer ici, au démarrage, vaut mieux que de laisser le premier
+            # envoi de fichier d'un utilisateur découvrir le problème.
+            raise CommandError(
+                "Stockage objet non configuré — variables manquantes : " + ", ".join(manquantes)
+            )
+
         try:
-            crees = StorageService.ensure_buckets()
+            StorageService.ensure_buckets()
         except Exception as exc:
-            # Le stockage est indisponible ou mal configuré. Échouer ici, au
-            # démarrage, vaut mieux que de laisser le premier envoi de fichier
-            # d'un utilisateur découvrir le problème en production.
             raise CommandError(f"Stockage objet inaccessible : {exc}") from exc
 
-        if crees:
-            self.stdout.write(self.style.SUCCESS(f"Compartiments créés : {', '.join(crees)}"))
-        else:
-            self.stdout.write("Tous les compartiments existent déjà.")
-
         self.stdout.write(
-            "Politique de lecture anonyme appliquée aux compartiments publics : "
-            + ", ".join(bucket_name(alias) for alias in PUBLIC_BUCKETS)
+            self.style.SUCCESS(f"Cloudinary configuré (compte {settings.CLOUDINARY_CLOUD_NAME}).")
         )
         self.stdout.write(
-            "Compartiments privés (aucune lecture non signée) : "
-            + ", ".join(bucket_name(alias) for alias in PRIVATE_BUCKETS)
+            "Aucun dossier à créer : chez Cloudinary un dossier naît au premier dépôt."
         )
+        self._annoncer()
 
     def _annoncer(self) -> None:
         for alias in PUBLIC_BUCKETS:
-            self.stdout.write(f"public  {alias:<10} → {bucket_name(alias)}")
+            self.stdout.write(f"public  {alias:<10} → {bucket_name(alias)}   (type=upload)")
         for alias in PRIVATE_BUCKETS:
-            self.stdout.write(f"privé   {alias:<10} → {bucket_name(alias)}")
+            self.stdout.write(f"privé   {alias:<10} → {bucket_name(alias)}   (type=private)")

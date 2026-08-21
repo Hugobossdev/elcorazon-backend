@@ -33,10 +33,6 @@ x-django: &django
   depends_on:
     db: {condition: service_healthy}
     redis: {condition: service_healthy}
-    # Le stockage objet est sur le chemin critique : l'API y crée ses
-    # compartiments au démarrage, et une commande sans photo de justificatif
-    # n'est pas une commande dégradée, c'est un envoi qui échoue.
-    minio: {condition: service_healthy}
   restart: unless-stopped
   logging: &journal
     driver: json-file
@@ -162,13 +158,23 @@ services:
     depends_on:
       redis: {condition: service_healthy}
 
+  # ⚠ TRANSITOIRE — le stockage objet est passé à Cloudinary (ADR-011), qui est
+  # joint par l'Internet et n'a rien à faire tourner ici. Plus aucun service de
+  # ce fichier ne parle à MinIO : il n'est conservé que pour donner accès aux
+  # fichiers déposés avant la bascule, le temps de :
+  #
+  #     docker compose -f docker-compose.prod.yml exec api   #         python manage.py migrate_media_to_cloudinary
+  #
+  # Une fois cette commande passée sans échec, supprimer ce bloc et le volume
+  # `miniodata` — après avoir vérifié qu'une sauvegarde en existe. Garder le
+  # volume jusque-là : c'est la seule copie de ces fichiers.
   minio:
     image: minio/minio
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?identifiant de stockage obligatoire}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?secret de stockage obligatoire}
-      MINIO_BROWSER: ${MINIO_BROWSER:-off}   # console fermée par défaut
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?mot de passe MinIO obligatoire}
+      MINIO_BROWSER: "off"   # console fermée : ce service ne sert plus qu'à lire
     volumes:
       - miniodata:/data
     expose:

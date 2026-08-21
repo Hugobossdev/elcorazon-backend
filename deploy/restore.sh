@@ -126,7 +126,9 @@ fi
 
 printf '\n'
 succes 'Restauration terminée'
-alerte "Le stockage objet n'est pas restauré par ce script."
+alerte "Le stockage objet est chez Cloudinary : rien à y restaurer."
+alerte "Ce qui suit ne concerne que les fichiers antérieurs à la bascule,"
+alerte "si la migration vers Cloudinary n'a pas encore été passée."
 alerte "Pour le remettre en place :"
 cat <<'STOCKAGE'
 

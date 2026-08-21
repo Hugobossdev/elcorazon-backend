@@ -10,8 +10,8 @@ groupes et d'options) : un second appel ne duplique rien.
 
 ## Les images
 
-Elles sont **téléchargées** dans le compartiment `products` de MinIO, pas
-référencées par une URL distante. C'est ce qu'impose `MenuItem.image`, qui est un
+Elles sont **téléchargées** dans le dossier `products` du stockage objet,
+pas référencées par une URL distante. C'est ce qu'impose `MenuItem.image`, qui est un
 `ImageField` : le catalogue doit rester lisible sans dépendre d'un hébergeur
 tiers, et les URL publiques servies ensuite sont celles du projet (ADR-011).
 

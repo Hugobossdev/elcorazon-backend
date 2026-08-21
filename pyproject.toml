@@ -24,7 +24,12 @@ dependencies = [
     "redis==6.*",
     "django-redis==6.*",
     "django-cors-headers==4.*",
-    "django-storages[s3]==1.*",
+    # Stockage objet. Le SDK seul, sans `django-cloudinary-storage` : ce dernier
+    # lève `ImproperlyConfigured` à l'import de son module quand les identifiants
+    # manquent, or `common/storage.py` est importé par quatre modèles et quatre
+    # migrations — sans compte Cloudinary, ni `migrate`, ni les tests, ni
+    # `collectstatic` ne démarreraient.
+    "cloudinary==1.*",
     "python-decouple==3.*",
     # Client HTTP du connecteur PayDunya. `httpx` plutôt que `requests` pour son
     # transport simulable : le connecteur se teste entièrement hors réseau, ce
@@ -192,14 +197,12 @@ ignore_errors = true
 # annotations, il suffit de retirer une ligne.
 [[tool.mypy.overrides]]
 module = [
-    "boto3",
-    "boto3.*",
-    "botocore",
-    "botocore.*",
     "celery",
     "celery.*",
     "channels",
     "channels.*",
+    "cloudinary",
+    "cloudinary.*",
     "decouple",
     "decouple.*",
     "django_filters",
@@ -208,12 +211,10 @@ module = [
     "django_redis.*",
     "pyogrio",
     "pyogrio.*",
-    "storages",
-    "storages.*",
 ]
 ignore_missing_imports = true
 
-# `django-storages` ne publie pas d'annotations : `S3Storage` est vu comme
+# `cloudinary` ne publie pas d'annotations : ses symboles sont vus comme
 # `Any`, et en hériter est refusé en mode strict. Même traitement que pour les
 # consommateurs Channels, et même limite — l'assouplissement ne couvre que le
 # module qui touche à la bibliothèque, jamais ses appelants.

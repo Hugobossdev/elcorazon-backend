@@ -421,46 +421,46 @@ SIMPLE_JWT = {
 
 # --------------------------------------------------------------- stockage
 #
-# Stockage objet **compatible S3** — MinIO en développement et en production,
-# AWS S3 le jour venu sans toucher au code (ADR-011). Rien n'est écrit en dur :
-# ni point d'accès, ni identifiants, ni nom de compartiment.
+# Stockage objet **Cloudinary**, en développement comme en production (ADR-011).
+# Le même fournisseur des deux côtés est un choix délibéré : un développement
+# qui écrit ailleurs qu'en production ne rencontre les écarts du fournisseur
+# qu'au déploiement, c'est-à-dire trop tard.
+#
+# Rien n'est écrit en dur : ni compte, ni identifiants, ni nom de dossier.
 #
 # Toute la mécanique vit dans `common/storage.py`, et **seulement là** : le
-# reste du projet n'importe ni `boto3` ni `django-storages`, ce qu'un test
-# d'architecture vérifie.
+# reste du projet n'importe pas `cloudinary`, ce qu'un test d'architecture
+# vérifie.
 
-STORAGE_ENDPOINT_URL: str = config("S3_ENDPOINT_URL", default="")
-STORAGE_REGION: str = config("S3_REGION", default="us-east-1")
-STORAGE_ACCESS_KEY: str = config("S3_ACCESS_KEY", default="")
-STORAGE_SECRET_KEY: str = config("S3_SECRET_KEY", default="")
-STORAGE_USE_SSL: bool = config("S3_USE_SSL", default=False, cast=bool)
+# Les trois valeurs du tableau de bord Cloudinary. Sans valeur de repli : une
+# valeur par défaut plausible ferait échouer les envois à l'exécution, avec une
+# erreur d'authentification, au lieu de manquer franchement ici.
+#
+# Vides, elles n'empêchent pas le projet de démarrer — c'est délibéré. Les
+# migrations, la suite de tests (stockage en mémoire) et `collectstatic` n'ont
+# aucune raison d'exiger un compte de stockage objet.
+CLOUDINARY_CLOUD_NAME: str = config("CLOUDINARY_CLOUD_NAME", default="")
+CLOUDINARY_API_KEY: str = config("CLOUDINARY_API_KEY", default="")
+CLOUDINARY_API_SECRET: str = config("CLOUDINARY_API_SECRET", default="")
 
-# MinIO ne résout pas un compartiment en sous-domaine (`bucket.hôte`) : il lui
-# faut le chemin (`hôte/bucket`). AWS accepte les deux, donc `path` reste juste
-# des deux côtés — la variable existe pour un CDN qui exigerait l'autre forme.
-STORAGE_ADDRESSING_STYLE: str = config("S3_ADDRESSING_STYLE", default="path")
-
-# Un compartiment par domaine plutôt qu'un seul fourre-tout. Ce n'est pas du
-# rangement : la politique de lecture se pose **sur le compartiment**, donc
-# c'est lui qui porte la frontière entre ce qui est public (le catalogue) et ce
-# qui ne l'est jamais (les pièces d'identité des livreurs).
+# Un dossier par domaine plutôt qu'un seul fourre-tout. Ce n'est pas du
+# rangement : c'est ce préfixe qui porte la frontière entre ce qui est public
+# (le catalogue) et ce qui ne l'est jamais (les pièces d'identité des livreurs).
+#
+# Chez S3 la visibilité se posait sur le compartiment ; chez Cloudinary elle est
+# portée par chaque objet, via son type de livraison. Le dossier ne la décide
+# donc plus — mais il continue de dire à quel domaine appartient un fichier, et
+# `common/storage.py` en déduit le type à l'envoi.
 STORAGE_BUCKETS: dict[str, str] = {
-    "products": config("S3_BUCKET_PRODUCTS", default="elcorazon-products"),
-    "banners": config("S3_BUCKET_BANNERS", default="elcorazon-banners"),
-    "users": config("S3_BUCKET_USERS", default="elcorazon-users"),
-    "documents": config("S3_BUCKET_DOCUMENTS", default="elcorazon-documents"),
+    "products": config("CLOUDINARY_FOLDER_PRODUCTS", default="elcorazon-products"),
+    "banners": config("CLOUDINARY_FOLDER_BANNERS", default="elcorazon-banners"),
+    "users": config("CLOUDINARY_FOLDER_USERS", default="elcorazon-users"),
+    "documents": config("CLOUDINARY_FOLDER_DOCUMENTS", default="elcorazon-documents"),
 }
-
-# Adresse publique des compartiments publics — celle que verra un navigateur.
-# Distincte du point d'accès interne : en production, l'API parle à MinIO par
-# le réseau Docker (`http://minio:9000`), que personne d'autre n'atteint. Vide,
-# les URL publiques retombent sur le point d'accès, ce qui convient en
-# développement.
-STORAGE_PUBLIC_BASE_URL: str = config("S3_PUBLIC_URL", default="")
 
 # Durée de vie d'une URL signée. Assez pour ouvrir un document, trop peu pour
 # qu'un lien copié dans un courriel serve encore le lendemain.
-STORAGE_SIGNED_URL_EXPIRE: int = config("S3_SIGNED_URL_EXPIRE", default=900, cast=int)
+STORAGE_SIGNED_URL_EXPIRE: int = config("CLOUDINARY_SIGNED_URL_EXPIRE", default=900, cast=int)
 
 STORAGES = {
     # Le stockage par défaut est **privé**. C'est le sens de la sécurité par

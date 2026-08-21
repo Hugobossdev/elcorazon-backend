@@ -58,7 +58,6 @@ services:
       DJANGO_SETTINGS_MODULE: config.settings.dev
       POSTGRES_HOST: db
       REDIS_URL: redis://redis:6379/0
-      S3_ENDPOINT_URL: http://minio:9000
     volumes:
       - .:/app          # rechargement à chaud
       - ./secrets:/run/secrets:ro
@@ -67,10 +66,6 @@ services:
     depends_on:
       db: {condition: service_healthy}
       redis: {condition: service_healthy}
-      # Les compartiments sont créés au démarrage, donc le stockage doit
-      # répondre avant l'API — sinon `docker compose up` échoue sur une
-      # installation neuve.
-      minio: {condition: service_healthy}
     restart: unless-stopped
 
   worker:
@@ -138,15 +133,24 @@ services:
       redis: {condition: service_healthy}
     restart: unless-stopped
 
-  # Stockage objet compatible S3 (ADR-011). L'API et la console d'administration
-  # sont exposées séparément : la première est parlée par le backend, la seconde
-  # sert à regarder ce qui a été écrit pendant le développement.
+  # ⚠ TRANSITOIRE — le stockage objet est passé à Cloudinary (ADR-011), et plus
+  # aucun service de ce fichier ne parle à MinIO. Il n'est conservé que pour
+  # donner accès aux fichiers déposés avant la bascule, le temps de :
+  #
+  #     python manage.py migrate_media_to_cloudinary
+  #
+  # Une fois cette commande passée sans échec, supprimer ce bloc, le volume
+  # `miniodata` en bas de fichier, et les ports 9000/9001. Garder le volume
+  # jusque-là : c'est la seule copie de ces fichiers.
   minio:
     image: minio/minio
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+      # En dur, et sans détour par `.env` : les variables `S3_*` n'existent
+      # plus. Ce service ne sert qu'à relire des fichiers déjà écrits, sur une
+      # machine de développement, le temps d'une commande.
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
     volumes:
       - miniodata:/data
     ports:

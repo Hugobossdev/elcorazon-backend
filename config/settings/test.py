@@ -82,11 +82,11 @@ CHANNEL_LAYERS = {"default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}
 CELERY_TASK_ALWAYS_EAGER = True
 CELERY_TASK_EAGER_PROPAGATES = True  # une tâche qui échoue fait échouer le test
 
-# Aucun octet ne sort vers un serveur S3 pendant la suite. Chaque alias
-# fonctionnel est substitué par un stockage en mémoire : les modèles gardent
-# leurs stockages nommés (`storages["documents"]`, …), et la substitution se
-# fait ici, sans que ni les champs ni les migrations n'aient à connaître les
-# tests.
+# Aucun octet ne sort vers Cloudinary pendant la suite, et aucun compte n'est
+# requis pour l'exécuter. Chaque alias fonctionnel est substitué par un stockage
+# en mémoire : les modèles gardent leurs stockages nommés
+# (`storages["documents"]`, …), et la substitution se fait ici, sans que ni les
+# champs ni les migrations n'aient à connaître les tests.
 _MEMOIRE = {"BACKEND": "django.core.files.storage.InMemoryStorage"}
 STORAGES = {
     "default": _MEMOIRE,

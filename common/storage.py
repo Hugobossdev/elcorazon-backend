@@ -1,55 +1,67 @@
-"""Stockage objet — S3, servi par MinIO en développement et en production.
+"""Stockage objet — Cloudinary, en développement comme en production.
 
-**MinIO n'est pas une dépendance du code, c'est un serveur S3.** Rien ici ne
-connaît MinIO : le protocole est celui d'Amazon S3, parlé par `boto3` à travers
-`django-storages`. Passer sur AWS S3 le jour venu ne demande que de changer
-`S3_ENDPOINT_URL` et les identifiants — aucune ligne de Python.
+**Cloudinary n'est pas une dépendance diffuse, c'est un fournisseur.** Rien
+ailleurs dans le projet ne le connaît : le reste du code passe par
+[`StorageService`] ou par les fabriques rattachées aux champs des modèles, et un
+test d'architecture le vérifie. Changer de fournisseur demain ne demande que de
+réécrire ce fichier — c'est précisément ce qui vient d'être fait, en venant de
+S3/MinIO, sans qu'aucun modèle, sérialiseur ni migration n'ait bougé.
+
+## Ce qui change en venant de S3, et ce qui ne change pas
+
+Cloudinary n'a pas de compartiments : il a des **dossiers**, qui ne sont qu'un
+préfixe dans l'identifiant public d'un objet. `STORAGE_BUCKETS` garde donc son
+nom et son rôle — un alias fonctionnel vers un espace de rangement — mais la
+valeur désigne un dossier, plus un compartiment. Le vocabulaire du code reste
+celui du domaine ; seule l'implémentation sait ce qu'il recouvre.
+
+**Ce que la base de données contient ne change pas.** Un champ fichier stocke
+toujours le chemin relatif — `menu/brownie-chocolat.jpg` — et jamais l'URL
+complète. C'est ce qui rend un changement de fournisseur possible sans toucher
+aux lignes existantes, et c'est aussi pourquoi `upload_to` continue de
+fonctionner tel quel.
 
 ## Deux visibilités, et c'est la seule chose qui compte
 
 Un catalogue se regarde ; une pièce d'identité ne se regarde pas. La séparation
 n'est donc pas un rangement, c'est une frontière :
 
-* **compartiments publics** (`products`, `banners`, `users`) — images de
-  produits, bannières, avatars. Servis directement, sans signature, avec une
-  mise en cache longue. Ce sont des fichiers destinés à être vus ;
-* **compartiment privé** (`documents`) — pièces d'identité, permis, cartes
-  grises, preuves de livraison. **Jamais servis en direct.** Chaque lecture
-  passe par une URL signée que le serveur émet, qui expire, et qui n'est
-  produite qu'après avoir vérifié qui demande.
+* **dossiers publics** (`products`, `banners`, `users`) — images de produits,
+  bannières, avatars. Livrés en `type=upload`, l'adresse publique de Cloudinary,
+  sans signature et avec une mise en cache longue par son CDN. Ce sont des
+  fichiers destinés à être vus ;
+* **dossier privé** (`documents`) — pièces d'identité, permis, cartes grises,
+  preuves de livraison. Déposés en `type=private`, que Cloudinary ne sert
+  **jamais** en accès anonyme. Chaque lecture passe par une URL signée que le
+  serveur émet, qui expire (`STORAGE_SIGNED_URL_EXPIRE`), et qui n'est produite
+  qu'après avoir vérifié qui demande.
 
-L'implémentation précédente rangeait tout dans un compartiment unique. Les
-documents des livreurs y étaient signés — ce qui était juste — mais l'image
-d'un burger l'était aussi : chaque URL expirait au bout de quinze minutes, donc
-aucun cache ni CDN ne pouvait s'y accrocher, et une page de catalogue mise en
-favori affichait des cadres vides le lendemain.
+## Pourquoi le SDK et non `django-cloudinary-storage`
 
-## Une seule porte
-
-Le reste du projet n'importe ni `boto3` ni `storages` : il passe par
-[`StorageService`] ou par les fabriques de stockage rattachées aux champs des
-modèles. Un test d'architecture le vérifie. La raison est concrète : le jour où
-l'on ajoute le chiffrement au repos, une politique de rétention ou un second
-fournisseur, il n'y a qu'un fichier à ouvrir.
+Le paquet d'intégration lève `ImproperlyConfigured` **à l'import de son module**
+quand les identifiants manquent. Or ce fichier est importé par quatre modèles et
+par quatre migrations : sans compte Cloudinary, ni `migrate`, ni les tests, ni
+`collectstatic` ne démarreraient — alors que la suite de tests utilise justement
+un stockage en mémoire pour ne dépendre d'aucun fournisseur. Le SDK, lui,
+s'importe sans identifiants et ne les réclame qu'au premier appel réseau.
 """
 
 from __future__ import annotations
 
-import json
+import io
+import posixpath
+import time
 from typing import IO, Any, ClassVar
-from urllib.parse import quote
+from urllib.parse import urlencode
 
-import boto3
-from botocore.client import Config as BotoConfig
-from botocore.exceptions import ClientError
+import cloudinary
+import cloudinary.api
+import cloudinary.uploader
+import cloudinary.utils
+import httpx
 from django.conf import settings
+from django.core.files.base import File
 from django.core.files.storage import Storage, storages
-from storages.backends.s3 import S3Storage
-
-#: Client `boto3` bas niveau. `boto3` ne publie pas d'annotations et les stubs
-#: (`boto3-stubs`) pèsent plus lourd que le service qu'ils typeraient : l'alias
-#: nomme l'intention là où le vérificateur ne peut rien garantir.
-type S3Client = Any
 
 __all__ = [
     "PRIVATE_BUCKETS",
@@ -67,31 +79,41 @@ __all__ = [
     "user_media",
 ]
 
-#: Compartiments dont le contenu est destiné à être vu de tous. Servis sans
+#: Dossiers dont le contenu est destiné à être vu de tous. Servis sans
 #: signature : une URL de photo de burger n'a aucune raison d'expirer.
 PUBLIC_BUCKETS = ("products", "banners", "users")
 
-#: Compartiments dont chaque lecture est autorisée une par une. Jamais servis
-#: en direct, jamais mis en cache par un intermédiaire.
+#: Dossiers dont chaque lecture est autorisée une par une. Jamais servis en
+#: direct, jamais mis en cache par un intermédiaire.
 PRIVATE_BUCKETS = ("documents",)
+
+#: Extensions que Cloudinary sait traiter comme des **images** — donc
+#: redimensionner, recadrer, convertir en WebP à la volée. Les autres partent en
+#: `raw`, c'est-à-dire livrées telles qu'elles ont été déposées.
+#:
+#: La liste est explicite plutôt que devinée : un PDF déposé dans un dossier
+#: public doit rester lisible, pas être refusé par un traitement d'image.
+IMAGE_EXTENSIONS = frozenset(
+    {"jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif", "heic", "tif", "tiff"}
+)
 
 
 class UnknownBucket(RuntimeError):
-    """Alias de compartiment absent de `STORAGE_BUCKETS`."""
+    """Alias de dossier absent de `STORAGE_BUCKETS`."""
 
     def __init__(self, alias: str) -> None:
         super().__init__(
-            f"Aucun compartiment configuré pour l'alias {alias!r}. "
+            f"Aucun dossier configuré pour l'alias {alias!r}. "
             f"Complétez STORAGE_BUCKETS dans les réglages."
         )
 
 
 def bucket_name(alias: str) -> str:
-    """Nom réel du compartiment derrière un alias fonctionnel.
+    """Nom réel du dossier derrière un alias fonctionnel.
 
     Le code désigne « les images de produits » ; le déploiement décide que cela
     s'appelle `elcorazon-products`, `elcorazon-prod-products` ou autre chose.
-    Aucun nom de compartiment n'est écrit dans le code.
+    Aucun nom de dossier n'est écrit en dur.
     """
     try:
         return str(settings.STORAGE_BUCKETS[alias])
@@ -99,68 +121,198 @@ def bucket_name(alias: str) -> str:
         raise UnknownBucket(alias) from exc
 
 
+def _configure() -> None:
+    """Arme le SDK depuis les réglages, juste avant de s'en servir.
+
+    Appelé à chaque accès plutôt qu'une fois pour toutes à l'import : c'est ce
+    qui permet aux tests de substituer un compte factice avec `override_settings`
+    sans réimporter le module, et c'est bon marché — `cloudinary.config()` ne
+    fait qu'écrire des attributs sur un singleton.
+    """
+    cloudinary.config(
+        cloud_name=settings.CLOUDINARY_CLOUD_NAME,
+        api_key=settings.CLOUDINARY_API_KEY,
+        api_secret=settings.CLOUDINARY_API_SECRET,
+        secure=True,
+    )
+
+
+def _identifiants(alias: str, chemin: str) -> tuple[str, str, str]:
+    """Traduit un (alias, chemin) en triplet Cloudinary.
+
+    Rend `(public_id, format, resource_type)`. C'est **le seul endroit** où la
+    convention de nommage est décidée, pour que le dépôt, la lecture, la
+    suppression et la signature ne puissent pas diverger — une URL signée sur un
+    identifiant que l'envoi n'a pas utilisé produirait un 404 que rien
+    n'expliquerait.
+
+    Deux conventions, imposées par Cloudinary lui-même :
+
+    * **image** — l'extension n'appartient pas à l'identifiant, elle est le
+      `format`. La conserver donnerait des adresses en `brownie.jpg.jpg` ;
+    * **raw** — l'extension fait partie de l'identifiant, et le format reste
+      vide. C'est ainsi que Cloudinary range un fichier livré tel quel.
+    """
+    complet = posixpath.join(bucket_name(alias), chemin.lstrip("/"))
+    racine, _, extension = complet.rpartition(".")
+
+    est_image = alias in PUBLIC_BUCKETS and extension.lower() in IMAGE_EXTENSIONS
+    if est_image and racine:
+        return racine, extension, "image"
+    return complet, "", "raw"
+
+
+def _type_livraison(alias: str) -> str:
+    """`upload` (public, servi par le CDN) ou `private` (jamais servi en direct)."""
+    return "upload" if alias in PUBLIC_BUCKETS else "private"
+
+
 # ------------------------------------------------------------------ stockages
 
 
-class ObjectStorage(S3Storage):
-    """Base des stockages du projet — un compartiment, une visibilité.
+class ObjectStorage(Storage):
+    """Base des stockages du projet — un dossier, une visibilité.
 
-    Les sous-classes ne déclarent que ces deux choses ; tout le reste (point
-    d'accès, identifiants, région, TLS) vient des réglages, communs à tous.
+    Les sous-classes ne déclarent que ces deux choses ; tout le reste (compte,
+    identifiants, TLS) vient des réglages, communs à tous.
     """
 
-    #: Alias fonctionnel, résolu en nom de compartiment à l'instanciation.
+    #: Alias fonctionnel, résolu en nom de dossier à l'usage.
     bucket_alias: ClassVar[str] = "products"
 
     #: Public = servi sans signature. Privé = URL signée, expirante, émise
     #: après contrôle d'accès.
     is_public: ClassVar[bool] = False
 
-    def __init__(self, **overrides: Any) -> None:
-        options: dict[str, Any] = {
-            "bucket_name": bucket_name(self.bucket_alias),
-            "endpoint_url": settings.STORAGE_ENDPOINT_URL or None,
-            "region_name": settings.STORAGE_REGION,
-            "use_ssl": settings.STORAGE_USE_SSL,
-            "access_key": settings.STORAGE_ACCESS_KEY or None,
-            "secret_key": settings.STORAGE_SECRET_KEY or None,
-            # MinIO ne sait pas résoudre un compartiment en sous-domaine
-            # (`bucket.host`) : il faut le chemin (`host/bucket`). AWS accepte
-            # les deux, donc ce réglage reste juste des deux côtés — et
-            # paramétrable pour le jour où un CDN exige l'autre forme.
-            "addressing_style": settings.STORAGE_ADDRESSING_STYLE,
-            "querystring_auth": not self.is_public,
-            "querystring_expire": settings.STORAGE_SIGNED_URL_EXPIRE,
-            # Deux fichiers de même nom ne s'écrasent pas. Avec l'écrasement
-            # (le défaut de django-storages), deux clients envoyant chacun un
-            # `photo.jpg` comme avatar auraient partagé le même objet : le
-            # second aurait remplacé le premier, qui aurait vu apparaître la
-            # photo d'un inconnu sur son profil.
-            "file_overwrite": False,
-            # Aucune ACL par objet : la visibilité est portée par la politique
-            # du compartiment, posée une fois (voir `StorageService.ensure_buckets`).
-            # Les ACL par objet sont refusées par défaut sur les compartiments
-            # AWS récents, et les poser ici ferait échouer chaque envoi.
-            "default_acl": None,
-            "signature_version": "s3v4",
-        }
-        options.update(overrides)
-        super().__init__(**options)
+    # -- écriture -------------------------------------------------------
 
-    # -- URL ------------------------------------------------------------
+    def _save(self, name: str, content: IO[bytes]) -> str:
+        """Dépose le fichier et rend le **chemin relatif**, pas l'identifiant.
+
+        C'est ce chemin que Django écrit dans la colonne. Le garder relatif est
+        ce qui rend le fournisseur remplaçable : une colonne qui contiendrait
+        `https://res.cloudinary.com/...` figerait Cloudinary dans les données.
+        """
+        public_id, extension, type_ressource = _identifiants(self.bucket_alias, name)
+        options: dict[str, Any] = {
+            "public_id": public_id,
+            "resource_type": type_ressource,
+            "type": _type_livraison(self.bucket_alias),
+            # Deux fichiers de même nom ne s'écrasent pas. Django a déjà écarté
+            # les collisions via `get_available_name`, qui s'appuie sur
+            # `exists()` ; ce garde-fou couvre la course entre les deux.
+            "overwrite": False,
+            # Purge le CDN : sans cela, un fichier remplacé continue d'être
+            # servi depuis les caches de bordure pendant des heures.
+            "invalidate": True,
+        }
+        if extension:
+            options["format"] = extension
+
+        if hasattr(content, "seek"):
+            content.seek(0)
+
+        _configure()
+        cloudinary.uploader.upload(content, **options)
+        return name
+
+    # -- lecture --------------------------------------------------------
+
+    def _open(self, name: str, mode: str = "rb") -> File:
+        """Relit un fichier déposé.
+
+        Passe par l'URL du stockage, donc signée pour un dossier privé : la
+        lecture d'une pièce d'identité emprunte le même chemin contrôlé que
+        celle d'un client, au lieu d'une porte dérobée réservée au serveur.
+        """
+        # `follow_redirects` : contrairement à `requests`, httpx ne suit rien par
+        # défaut, et le point de téléchargement des objets privés renvoie une
+        # redirection vers l'objet lui-même. Sans ce drapeau, la lecture d'un
+        # document rendrait un corps vide avec un code 302 — pas une erreur.
+        reponse = httpx.get(self.url(name), timeout=30, follow_redirects=True)
+        reponse.raise_for_status()
+        return File(io.BytesIO(reponse.content), name=name)
 
     def url(self, name: str, parameters: dict[str, Any] | None = None, **kwargs: Any) -> str:
-        """URL de lecture.
+        """Adresse de lecture.
 
-        Publique et stable pour un compartiment public, signée et expirante
-        pour un compartiment privé — c'est `querystring_auth` qui tranche, et
-        il est décidé par la classe, pas par l'appelant. Aucun site d'appel ne
-        peut donc rendre publique une pièce d'identité en oubliant un argument.
+        Publique et stable pour un dossier public, signée et expirante pour un
+        dossier privé — c'est `is_public` qui tranche, et il est décidé par la
+        classe, pas par l'appelant. Aucun site d'appel ne peut donc rendre
+        publique une pièce d'identité en oubliant un argument.
         """
-        if self.is_public and settings.STORAGE_PUBLIC_BASE_URL:
-            base = settings.STORAGE_PUBLIC_BASE_URL.rstrip("/")
-            return f"{base}/{self.bucket_name}/{quote(name)}"
-        return str(super().url(name, parameters=parameters, **kwargs))
+        if not self.is_public:
+            return StorageService.presigned_url(self.bucket_alias, name)
+
+        public_id, extension, type_ressource = _identifiants(self.bucket_alias, name)
+        _configure()
+        adresse, _ = cloudinary.utils.cloudinary_url(
+            public_id,
+            resource_type=type_ressource,
+            type="upload",
+            format=extension or None,
+            secure=True,
+        )
+        return str(adresse)
+
+    # -- interrogation --------------------------------------------------
+
+    def exists(self, name: str) -> bool:
+        """Le fichier est-il déjà là ?
+
+        Django s'en sert avant chaque dépôt pour ne pas écraser : c'est ce qui
+        garantit que deux clients envoyant chacun un `photo.jpg` comme avatar
+        ne partagent pas le même objet.
+        """
+        public_id, _, type_ressource = _identifiants(self.bucket_alias, name)
+        _configure()
+        try:
+            cloudinary.api.resource(
+                public_id,
+                resource_type=type_ressource,
+                type=_type_livraison(self.bucket_alias),
+            )
+        except cloudinary.api.NotFound:
+            return False
+        return True
+
+    def size(self, name: str) -> int:
+        public_id, _, type_ressource = _identifiants(self.bucket_alias, name)
+        _configure()
+        details = cloudinary.api.resource(
+            public_id,
+            resource_type=type_ressource,
+            type=_type_livraison(self.bucket_alias),
+        )
+        return int(details.get("bytes", 0))
+
+    def listdir(self, path: str) -> tuple[list[str], list[str]]:
+        """Non implémenté, et volontairement.
+
+        Rien dans le projet ne parcourt un dossier, et un stockage qui sait
+        s'inventorier invite à le faire — or lister le dossier privé reviendrait
+        à énumérer les pièces d'identité des livreurs.
+        """
+        raise NotImplementedError(
+            "Le stockage objet ne s'inventorie pas : interroger les modèles, "
+            "qui savent quels fichiers existent."
+        )
+
+    # -- suppression ----------------------------------------------------
+
+    def delete(self, name: str) -> None:
+        """Efface. Silencieux si le fichier n'existe plus : effacer deux fois
+        n'est pas une erreur."""
+        if not name:
+            return
+        public_id, _, type_ressource = _identifiants(self.bucket_alias, name)
+        _configure()
+        cloudinary.uploader.destroy(
+            public_id,
+            resource_type=type_ressource,
+            type=_type_livraison(self.bucket_alias),
+            invalidate=True,
+        )
 
 
 class ProductImageStorage(ObjectStorage):
@@ -190,13 +342,11 @@ class UserMediaStorage(ObjectStorage):
 
 
 class CourierDocumentStorage(ObjectStorage):
-    """Pièces justificatives et preuves de livraison — **privé**.
+    """Pièces d'identité, permis, cartes grises, preuves de livraison.
 
-    Une pièce d'identité n'est lisible que par le personnel habilité, et une
-    fois : l'URL est signée, elle expire, et elle n'est émise qu'après
-    vérification du droit d'en connaître. Ces documents ont vécu dans un
-    compartiment public dans l'implémentation précédente — une pièce d'identité
-    y était lisible indéfiniment par qui connaissait l'adresse.
+    Privé, et c'est la seule chose à retenir : Cloudinary ne sert aucun objet
+    `type=private` en accès anonyme, et chaque lecture exige une URL signée
+    émise par le serveur pour une durée bornée.
     """
 
     bucket_alias = "documents"
@@ -207,8 +357,8 @@ class CourierDocumentStorage(ObjectStorage):
 #
 # Les champs `FileField` reçoivent une **fonction**, pas une instance. Django
 # sérialise alors son chemin d'import dans la migration, et non l'état d'un
-# objet configuré : les identifiants et le point d'accès du jour ne se figent
-# pas dans un fichier de migration versionné.
+# objet configuré : les identifiants et le compte du jour ne se figent pas dans
+# un fichier de migration versionné.
 #
 # Le passage par le registre `STORAGES` permet en outre aux tests de substituer
 # un stockage en mémoire sans toucher aux modèles — voir `config/settings/test.py`.
@@ -276,7 +426,7 @@ class StorageService:
 
     @staticmethod
     def url(alias: str, path: str) -> str:
-        """Adresse de lecture, selon la visibilité du compartiment.
+        """Adresse de lecture, selon la visibilité du dossier.
 
         Publique et durable pour une image de catalogue, signée et expirante
         pour un document. L'appelant n'a pas à choisir — c'est précisément ce
@@ -291,13 +441,22 @@ class StorageService:
         À n'appeler qu'après avoir vérifié que le demandeur a le droit de lire
         ce document : la signature ne prouve rien sur lui, elle prouve
         seulement que le serveur a accepté.
+
+        Passe par le point de téléchargement de Cloudinary et non par une URL de
+        livraison signée : cette dernière porte bien une signature, mais **elle
+        n'expire pas**. Un lien transmis une fois resterait valable pour
+        toujours, ce qui est exactement ce qu'on refuse à une pièce d'identité.
         """
         delai = expire if expire is not None else settings.STORAGE_SIGNED_URL_EXPIRE
+        public_id, extension, type_ressource = _identifiants(alias, path)
+        _configure()
         return str(
-            StorageService._client().generate_presigned_url(
-                "get_object",
-                Params={"Bucket": bucket_name(alias), "Key": path},
-                ExpiresIn=delai,
+            cloudinary.utils.private_download_url(
+                public_id,
+                extension,
+                resource_type=type_ressource,
+                type=_type_livraison(alias),
+                expires_at=int(time.time()) + delai,
             )
         )
 
@@ -312,107 +471,58 @@ class StorageService:
         """URL d'envoi signée — le client dépose son fichier sans passer par l'API.
 
         Utile pour les gros fichiers, qu'il serait absurde de faire transiter
-        par le serveur applicatif. L'URL vise **un chemin précis** : elle ne
-        donne pas le droit d'écrire ailleurs dans le compartiment.
+        par le serveur applicatif. La signature couvre **l'identifiant visé** :
+        elle ne donne pas le droit d'écrire ailleurs dans le dossier.
+
+        Contrairement à S3, où l'on signait un `PUT`, Cloudinary attend un
+        `POST` multipart sur son point d'envoi, les paramètres signés étant
+        portés par la chaîne de requête. `content_type` n'y a pas d'équivalent :
+        le type est déduit du fichier reçu, et la nature de la ressource est
+        déjà fixée par `resource_type`.
         """
+        del content_type  # sans objet chez ce fournisseur — voir la docstring
         delai = expire if expire is not None else settings.STORAGE_SIGNED_URL_EXPIRE
-        return str(
-            StorageService._client().generate_presigned_url(
-                "put_object",
-                Params={
-                    "Bucket": bucket_name(alias),
-                    "Key": path,
-                    "ContentType": content_type,
-                },
-                ExpiresIn=delai,
-            )
+        public_id, extension, type_ressource = _identifiants(alias, path)
+        _configure()
+
+        horodatage = int(time.time())
+        parametres: dict[str, Any] = {
+            "public_id": public_id,
+            "type": _type_livraison(alias),
+            "timestamp": horodatage,
+            "expires_at": horodatage + delai,
+        }
+        if extension:
+            parametres["format"] = extension
+
+        parametres["signature"] = cloudinary.utils.api_sign_request(
+            parametres, str(cloudinary.config().api_secret)
         )
+        parametres["api_key"] = cloudinary.config().api_key
+
+        base = cloudinary.utils.cloudinary_api_url("upload", resource_type=type_ressource)
+        return f"{base}?{urlencode(parametres)}"
 
     # -- provisionnement ------------------------------------------------
 
     @staticmethod
     def ensure_buckets() -> list[str]:
-        """Crée les compartiments manquants et pose leur politique de lecture.
+        """Sans objet chez Cloudinary — rend une liste vide, et c'est un résultat.
 
-        Rend la liste de ceux qui ont été créés. Idempotent : appelée au
-        démarrage d'un environnement de développement, elle ne fait rien la
-        deuxième fois.
+        Un dossier Cloudinary n'existe pas en tant qu'objet : c'est un préfixe
+        dans l'identifiant d'une ressource, créé implicitement au premier dépôt.
+        Il n'y a donc rien à provisionner, et rien ne peut manquer.
 
-        Les compartiments publics reçoivent une politique de **lecture seule
-        anonyme** — lire, jamais lister ni écrire. Le compartiment privé n'en
-        reçoit aucune : sans politique, S3 refuse tout ce qui n'est pas signé,
-        ce qui est exactement le comportement voulu.
+        La visibilité, elle, ne dépend pas d'une politique posée sur un
+        contenant comme chez S3 : elle est portée **par chaque objet**, via son
+        `type` de livraison, décidé à l'envoi par la classe de stockage. Un
+        fichier du dossier privé est déposé en `type=private` quoi qu'il arrive,
+        sans qu'aucune politique n'ait à être posée au préalable — une étape de
+        moins, et une étape de moins qu'on peut oublier.
+
+        La méthode et sa commande sont conservées plutôt que supprimées : elles
+        sont appelées au démarrage dans `docker-compose.yml` et
+        `docker-compose.prod.yml`, et les retirer ferait échouer deux séquences
+        de démarrage pour un gain nul.
         """
-        client = StorageService._client()
-        crees: list[str] = []
-
-        for alias in (*PUBLIC_BUCKETS, *PRIVATE_BUCKETS):
-            nom = bucket_name(alias)
-            if StorageService._create_if_absent(client, nom):
-                crees.append(nom)
-            if alias in PUBLIC_BUCKETS:
-                StorageService._apply_public_read_policy(client, nom)
-
-        return crees
-
-    @staticmethod
-    def _create_if_absent(client: S3Client, nom: str) -> bool:
-        try:
-            client.head_bucket(Bucket=nom)
-            return False
-        except ClientError as exc:
-            statut = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            if statut not in (403, 404):
-                raise
-
-        # `403` signifie « il existe et il n'est pas à vous » : le créer
-        # échouerait, et le signaler tout de suite vaut mieux qu'un envoi
-        # refusé plus tard, à l'exécution.
-        if statut == 403:
-            raise PermissionError(
-                f"Le compartiment {nom!r} existe mais n'est pas accessible avec ces identifiants."
-            )
-
-        client.create_bucket(Bucket=nom)
-        return True
-
-    @staticmethod
-    def _apply_public_read_policy(client: S3Client, nom: str) -> None:
-        politique = {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Sid": "LectureAnonyme",
-                    "Effect": "Allow",
-                    "Principal": {"AWS": ["*"]},
-                    # Lecture d'un objet **désigné** : ni `ListBucket`, ni
-                    # `PutObject`. Sans cette restriction, un compartiment
-                    # « public » laisserait inventorier son contenu, ce qui
-                    # revient à publier la liste des fichiers.
-                    "Action": ["s3:GetObject"],
-                    "Resource": [f"arn:aws:s3:::{nom}/*"],
-                }
-            ],
-        }
-        client.put_bucket_policy(Bucket=nom, Policy=json.dumps(politique))
-
-    @staticmethod
-    def _client() -> S3Client:
-        """Client S3 bas niveau — le **seul** du projet.
-
-        `boto3` n'est importé nulle part ailleurs : un test d'architecture le
-        vérifie. Ce qui compte n'est pas l'esthétique mais le point de reprise :
-        chiffrement au repos, rétention, second fournisseur se règlent ici.
-        """
-        return boto3.client(
-            "s3",
-            endpoint_url=settings.STORAGE_ENDPOINT_URL or None,
-            region_name=settings.STORAGE_REGION,
-            aws_access_key_id=settings.STORAGE_ACCESS_KEY or None,
-            aws_secret_access_key=settings.STORAGE_SECRET_KEY or None,
-            use_ssl=settings.STORAGE_USE_SSL,
-            config=BotoConfig(
-                signature_version="s3v4",
-                s3={"addressing_style": settings.STORAGE_ADDRESSING_STYLE},
-            ),
-        )
+        return []

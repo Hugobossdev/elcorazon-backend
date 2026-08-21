@@ -99,7 +99,7 @@ succes 'Image construite'
 info 'Démarrage des services'
 # `--wait` fait attendre les healthchecks : le script ne rend la main qu'une
 # fois l'API réellement joignable, pas seulement le conteneur lancé.
-$COMPOSE up -d --wait db redis minio
+$COMPOSE up -d --wait db redis
 $COMPOSE up -d --wait api
 $COMPOSE up -d worker beat nginx certbot
 succes 'Services démarrés'

@@ -70,12 +70,12 @@ class CourierProfile(UUIDModel, TimeStampedModel):
     vehicle_type = models.CharField(max_length=16, choices=VehicleType.choices)
     vehicle_plate = models.CharField(max_length=32, blank=True)
 
-    # Pièces justificatives. **Compartiment privé**, sans politique de lecture
-    # anonyme : S3 refuse toute requête non signée, et chaque URL est émise par
-    # le serveur pour une durée bornée (`S3_SIGNED_URL_EXPIRE`, ADR-011). Ces
-    # documents ont vécu dans un compartiment public dans l'implémentation
-    # précédente — une pièce d'identité y était lisible indéfiniment par qui
-    # connaissait l'adresse.
+    # Pièces justificatives. **Dossier privé** : déposées en `type=private`,
+    # que Cloudinary ne sert jamais en accès anonyme, et chaque URL est émise
+    # par le serveur pour une durée bornée (`CLOUDINARY_SIGNED_URL_EXPIRE`,
+    # ADR-011). Ces documents ont vécu dans un espace public dans
+    # l'implémentation précédente — une pièce d'identité y était lisible
+    # indéfiniment par qui connaissait l'adresse.
     id_document = models.FileField(
         upload_to="couriers/id/", storage=courier_documents, null=True, blank=True
     )

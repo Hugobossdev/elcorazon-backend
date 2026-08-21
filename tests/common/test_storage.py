@@ -5,14 +5,18 @@ L'enjeu n'est pas la couverture : c'est la **frontière**. Une image de burger
 servie sans signature est une bonne chose ; une pièce d'identité servie sans
 signature est un incident. Ces tests fixent laquelle est laquelle, et vérifient
 qu'aucun site d'appel ne peut inverser les deux par étourderie.
+
+Aucun octet ne part sur le réseau : la suite substitue un stockage en mémoire
+(`config/settings/test.py`), et les URL de Cloudinary sont des calculs de
+signature, faits hors ligne. Ce qui est vérifié ici est la **décision** — quel
+identifiant, quel type de livraison, signé ou non — pas l'implémentation du SDK.
 """
 
 from __future__ import annotations
 
 import ast
-import json
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import ClassVar
 
 import pytest
 from django.test import override_settings
@@ -26,18 +30,16 @@ from common.storage import (
     StorageService,
     UnknownBucket,
     UserMediaStorage,
+    _identifiants,
     bucket_name,
 )
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
 STOCKAGE_REEL = {
-    "STORAGE_ENDPOINT_URL": "http://minio:9000",
-    "STORAGE_REGION": "us-east-1",
-    "STORAGE_ACCESS_KEY": "cle",
-    "STORAGE_SECRET_KEY": "secret",
-    "STORAGE_USE_SSL": False,
-    "STORAGE_ADDRESSING_STYLE": "path",
+    "CLOUDINARY_CLOUD_NAME": "compte-de-test",
+    "CLOUDINARY_API_KEY": "123456789",
+    "CLOUDINARY_API_SECRET": "secret-de-test",
     "STORAGE_SIGNED_URL_EXPIRE": 900,
     "STORAGE_BUCKETS": {
         "products": "test-products",
@@ -57,26 +59,45 @@ class TestVisibilite:
     )
     def test_les_medias_du_catalogue_sont_publics(self, classe: type) -> None:
         with override_settings(**STOCKAGE_REEL):
-            stockage = classe()
+            url = classe().url("dossier/fichier.jpg")
 
         # Sans signature : une URL d'image doit pouvoir être mise en cache par
         # un navigateur, un CDN, et retrouvée dans un favori le lendemain.
-        assert stockage.querystring_auth is False
+        assert "signature=" not in url
+        assert "expires_at=" not in url
+        assert "/image/upload/" in url
 
     def test_les_documents_livreurs_sont_prives(self) -> None:
         with override_settings(**STOCKAGE_REEL):
-            stockage = CourierDocumentStorage()
+            url = CourierDocumentStorage().url("couriers/id/cni.pdf")
 
         # Chaque lecture est signée et expire. C'est ce qui manquait à
         # l'implémentation précédente, où les pièces d'identité vivaient dans
-        # un compartiment public — lisibles indéfiniment par qui connaissait
+        # un espace public — lisibles indéfiniment par qui connaissait
         # l'adresse.
-        assert stockage.querystring_auth is True
-        assert stockage.querystring_expire == 900
+        assert "signature=" in url
+        assert "expires_at=" in url
+
+    def test_une_url_de_document_n_est_jamais_servie_par_le_cdn(self) -> None:
+        """La distinction est plus forte qu'une signature : un document ne passe
+        pas par l'adresse de livraison publique du tout."""
+        with override_settings(**STOCKAGE_REEL):
+            url = CourierDocumentStorage().url("couriers/id/cni.pdf")
+
+        assert not url.startswith("https://res.cloudinary.com/")
+
+    def test_les_documents_sont_deposes_en_type_prive(self) -> None:
+        """`type=private` : Cloudinary refuse alors tout accès anonyme, quelle
+        que soit la connaissance qu'on a de l'identifiant."""
+        from common.storage import _type_livraison
+
+        assert _type_livraison("documents") == "private"
+        for alias in PUBLIC_BUCKETS:
+            assert _type_livraison(alias) == "upload"
 
     def test_le_stockage_par_defaut_est_prive(self) -> None:
         """Sécurité par défaut : un champ fichier ajouté sans stockage
-        explicite atterrit dans le compartiment signé, pas en libre accès.
+        explicite atterrit dans l'espace signé, pas en libre accès.
 
         Vérifié sur la source des réglages communs : la suite substitue un
         stockage en mémoire, donc `settings.STORAGES` ne dit rien de ce qui
@@ -85,193 +106,181 @@ class TestVisibilite:
 
         assert '"default": {"BACKEND": "common.storage.CourierDocumentStorage"}' in source
 
-    def test_aucun_compartiment_n_est_a_la_fois_public_et_prive(self) -> None:
+    def test_aucun_dossier_n_est_a_la_fois_public_et_prive(self) -> None:
         assert not set(PUBLIC_BUCKETS) & set(PRIVATE_BUCKETS)
 
-    def test_les_documents_ne_sont_pas_dans_un_compartiment_public(self) -> None:
-        # La séparation est portée par le compartiment, parce que c'est lui qui
-        # porte la politique de lecture. Ranger les documents avec les images
-        # rendrait la frontière inexprimable.
+    def test_les_documents_ne_sont_pas_dans_un_dossier_public(self) -> None:
+        # La séparation est portée par le dossier, parce que c'est de lui que
+        # `common/storage.py` déduit le type de livraison à l'envoi. Ranger les
+        # documents avec les images rendrait la frontière inexprimable.
         assert "documents" in PRIVATE_BUCKETS
         assert "documents" not in PUBLIC_BUCKETS
 
 
-class TestCompartiments:
+class TestDossiers:
     def test_les_noms_viennent_des_reglages(self) -> None:
         with override_settings(**STOCKAGE_REEL):
             assert bucket_name("products") == "test-products"
             assert bucket_name("documents") == "test-documents"
 
     def test_un_alias_inconnu_echoue_bruyamment(self) -> None:
-        """Plutôt qu'un compartiment inventé, dans lequel des fichiers
-        partiraient sans que personne ne les retrouve."""
+        """Plutôt qu'un dossier inventé, dans lequel des fichiers partiraient
+        sans que personne ne les retrouve."""
         with override_settings(**STOCKAGE_REEL), pytest.raises(UnknownBucket):
             bucket_name("inexistant")
 
-    def test_chaque_domaine_a_son_compartiment(self) -> None:
+    def test_chaque_domaine_a_son_dossier(self) -> None:
         with override_settings(**STOCKAGE_REEL):
             noms = {
-                ProductImageStorage().bucket_name,
-                BannerStorage().bucket_name,
-                UserMediaStorage().bucket_name,
-                CourierDocumentStorage().bucket_name,
+                bucket_name(ProductImageStorage.bucket_alias),
+                bucket_name(BannerStorage.bucket_alias),
+                bucket_name(UserMediaStorage.bucket_alias),
+                bucket_name(CourierDocumentStorage.bucket_alias),
             }
 
         assert len(noms) == 4
 
 
+class TestConventionDeNommage:
+    """Un dépôt et une lecture doivent viser le **même** identifiant.
+
+    C'est la faute la plus coûteuse à diagnostiquer : l'envoi réussit, l'URL est
+    bien formée, et le fichier répond 404 parce que les deux côtés ont calculé
+    l'identifiant différemment.
+    """
+
+    def test_une_image_publique_porte_son_extension_en_format(self) -> None:
+        """Sans quoi l'adresse finirait en `brownie.jpg.jpg` : Cloudinary
+        réaccole le format à l'identifiant."""
+        with override_settings(**STOCKAGE_REEL):
+            public_id, extension, ressource = _identifiants("products", "menu/brownie.jpg")
+
+        assert public_id == "test-products/menu/brownie"
+        assert extension == "jpg"
+        assert ressource == "image"
+
+    def test_un_document_prive_garde_son_extension_dans_l_identifiant(self) -> None:
+        """Convention inverse, imposée par Cloudinary : une ressource `raw` est
+        rangée sous son nom de fichier complet."""
+        with override_settings(**STOCKAGE_REEL):
+            public_id, extension, ressource = _identifiants("documents", "couriers/id/cni.pdf")
+
+        assert public_id == "test-documents/couriers/id/cni.pdf"
+        assert extension == ""
+        assert ressource == "raw"
+
+    def test_un_pdf_dans_un_dossier_public_reste_livre_tel_quel(self) -> None:
+        """Un PDF ne se redimensionne pas : le traiter comme une image le ferait
+        refuser à l'envoi."""
+        with override_settings(**STOCKAGE_REEL):
+            _, _, ressource = _identifiants("products", "fiches/carte.pdf")
+
+        assert ressource == "raw"
+
+    def test_le_dossier_prefixe_toujours_l_identifiant(self) -> None:
+        """C'est ce préfixe qui sépare les domaines à l'intérieur d'un compte
+        Cloudinary unique — l'équivalent de ce que faisait le compartiment."""
+        with override_settings(**STOCKAGE_REEL):
+            for alias, attendu in [
+                ("products", "test-products/"),
+                ("banners", "test-banners/"),
+                ("users", "test-users/"),
+                ("documents", "test-documents/"),
+            ]:
+                public_id, _, _ = _identifiants(alias, "un/chemin.bin")
+                assert public_id.startswith(attendu)
+
+
 class TestUrlPublique:
-    def test_l_adresse_publique_prime_sur_le_point_d_acces_interne(self) -> None:
-        """En production, l'API parle à MinIO par le réseau Docker
-        (`http://minio:9000`), que personne d'autre n'atteint. Sans cette
-        substitution, les applications recevraient des URL d'images
-        injoignables depuis un téléphone."""
-        with override_settings(**STOCKAGE_REEL, STORAGE_PUBLIC_BASE_URL="https://cdn.example.com"):
+    def test_l_adresse_est_absolue_et_directement_exploitable(self) -> None:
+        """C'est ce que reçoit l'application Flutter. Une URL relative, ou
+        pointant sur un hôte que seul le réseau interne résout, afficherait des
+        cadres vides sans que l'API n'ait rien signalé."""
+        with override_settings(**STOCKAGE_REEL):
             url = ProductImageStorage().url("menu/burger.jpg")
 
-        assert url == "https://cdn.example.com/test-products/menu/burger.jpg"
+        assert url == (
+            "https://res.cloudinary.com/compte-de-test/image/upload/v1/"
+            "test-products/menu/burger.jpg"
+        )
 
     def test_l_adresse_publique_ne_porte_jamais_de_signature(self) -> None:
-        with override_settings(**STOCKAGE_REEL, STORAGE_PUBLIC_BASE_URL="https://cdn.example.com"):
+        with override_settings(**STOCKAGE_REEL):
             url = ProductImageStorage().url("menu/burger.jpg")
 
-        assert "X-Amz-Signature" not in url
+        assert "signature=" not in url
         assert "?" not in url
 
+    def test_l_adresse_est_toujours_en_https(self) -> None:
+        """Une image servie en clair depuis une page en HTTPS est bloquée par le
+        navigateur, et signalée par Android comme trafic non chiffré."""
+        with override_settings(**STOCKAGE_REEL):
+            for stockage in (ProductImageStorage(), BannerStorage(), UserMediaStorage()):
+                assert stockage.url("un/fichier.png").startswith("https://")
+
     def test_les_espaces_et_accents_sont_encodes(self) -> None:
-        with override_settings(**STOCKAGE_REEL, STORAGE_PUBLIC_BASE_URL="https://cdn.example.com"):
+        with override_settings(**STOCKAGE_REEL):
             url = ProductImageStorage().url("menu/poulet braisé.jpg")
 
         assert " " not in url
-        assert url.startswith("https://cdn.example.com/test-products/menu/")
-
-    def test_la_barre_finale_de_l_adresse_ne_double_pas(self) -> None:
-        with override_settings(**STOCKAGE_REEL, STORAGE_PUBLIC_BASE_URL="https://cdn.example.com/"):
-            url = ProductImageStorage().url("menu/burger.jpg")
-
-        assert "//test-products" not in url
-
-    def test_un_document_prive_ignore_l_adresse_publique(self) -> None:
-        """Même configurée, elle ne s'applique pas : un document se lit par une
-        URL signée ou pas du tout."""
-        with override_settings(**STOCKAGE_REEL, STORAGE_PUBLIC_BASE_URL="https://cdn.example.com"):
-            stockage = CourierDocumentStorage()
-
-        assert stockage.is_public is False
-        assert stockage.querystring_auth is True
 
 
-class _ClientFactice:
-    """Serveur S3 simulé — de quoi vérifier ce qui lui est demandé.
+class TestUrlSignee:
+    def test_la_signature_expire(self) -> None:
+        """Une URL signée qui n'expire pas est un lien permanent déguisé : celui
+        qui l'a reçue une fois garde l'accès pour toujours."""
+        with override_settings(**STOCKAGE_REEL):
+            url = StorageService.presigned_url("documents", "couriers/id/cni.pdf")
 
-    Aucun octet ne part sur le réseau : ce qui est testé ici est la **décision**
-    (créer ou non, quelle politique), pas l'implémentation de boto3.
-    """
+        assert "expires_at=" in url
 
-    def __init__(self, existants: set[str] | None = None) -> None:
-        self.existants = existants or set()
-        self.crees: list[str] = []
-        self.politiques: dict[str, dict[str, Any]] = {}
-
-    def head_bucket(self, Bucket: str) -> None:  # noqa: N803 - signature boto3
-        if Bucket not in self.existants:
-            from botocore.exceptions import ClientError
-
-            raise ClientError(
-                {"Error": {"Code": "404"}, "ResponseMetadata": {"HTTPStatusCode": 404}},
-                "HeadBucket",
-            )
-
-    def create_bucket(self, Bucket: str) -> None:  # noqa: N803 - signature boto3
-        self.crees.append(Bucket)
-        self.existants.add(Bucket)
-
-    def put_bucket_policy(self, Bucket: str, Policy: str) -> None:  # noqa: N803
-        self.politiques[Bucket] = json.loads(Policy)
-
-
-class TestCreationDesCompartiments:
-    def test_cree_les_quatre_compartiments(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        client = _ClientFactice()
-        monkeypatch.setattr(StorageService, "_client", staticmethod(lambda: client))
+    def test_le_delai_par_defaut_vient_des_reglages(self) -> None:
+        import time
 
         with override_settings(**STOCKAGE_REEL):
-            crees = StorageService.ensure_buckets()
+            url = StorageService.presigned_url("documents", "couriers/id/cni.pdf")
 
-        assert sorted(crees) == [
-            "test-banners",
-            "test-documents",
-            "test-products",
-            "test-users",
-        ]
+        expiration = int(url.split("expires_at=")[1].split("&")[0])
 
-    def test_est_idempotente(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Appelée à chaque démarrage : la seconde fois ne doit rien faire.
-        C'est ce qui permet de la mettre dans la commande de lancement plutôt
-        que dans une procédure manuelle — les procédures manuelles se sautent."""
-        client = _ClientFactice(
-            existants={"test-products", "test-banners", "test-users", "test-documents"}
-        )
-        monkeypatch.setattr(StorageService, "_client", staticmethod(lambda: client))
+        # 900 s ± la seconde d'exécution du test.
+        assert 895 <= expiration - int(time.time()) <= 905
+
+    def test_un_delai_explicite_prime(self) -> None:
+        import time
 
         with override_settings(**STOCKAGE_REEL):
-            crees = StorageService.ensure_buckets()
+            url = StorageService.presigned_url("documents", "couriers/id/cni.pdf", expire=60)
 
-        assert crees == []
-        assert client.crees == []
+        expiration = int(url.split("expires_at=")[1].split("&")[0])
 
-    def test_seuls_les_compartiments_publics_recoivent_une_politique(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        client = _ClientFactice()
-        monkeypatch.setattr(StorageService, "_client", staticmethod(lambda: client))
+        assert 55 <= expiration - int(time.time()) <= 65
 
+    def test_deux_documents_differents_ont_des_signatures_differentes(self) -> None:
+        """La signature couvre l'identifiant : elle ne peut pas être rejouée sur
+        un autre document."""
         with override_settings(**STOCKAGE_REEL):
-            StorageService.ensure_buckets()
+            une = StorageService.presigned_url("documents", "couriers/id/a.pdf")
+            autre = StorageService.presigned_url("documents", "couriers/id/b.pdf")
 
-        assert set(client.politiques) == {"test-products", "test-banners", "test-users"}
-        # Le compartiment privé n'en reçoit aucune : sans politique, S3 refuse
-        # tout ce qui n'est pas signé — exactement le comportement voulu.
-        assert "test-documents" not in client.politiques
+        assert une.split("signature=")[1] != autre.split("signature=")[1]
 
-    def test_la_politique_publique_autorise_la_lecture_et_rien_d_autre(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        client = _ClientFactice()
-        monkeypatch.setattr(StorageService, "_client", staticmethod(lambda: client))
 
+class TestProvisionnement:
+    """Chez Cloudinary il n'y a rien à provisionner — et c'est un résultat."""
+
+    def test_ensure_buckets_ne_cree_rien(self) -> None:
+        """Un dossier n'existe pas en tant qu'objet : c'est un préfixe dans
+        l'identifiant d'une ressource, né au premier dépôt."""
         with override_settings(**STOCKAGE_REEL):
-            StorageService.ensure_buckets()
+            assert StorageService.ensure_buckets() == []
 
-        instruction = client.politiques["test-products"]["Statement"][0]
+    def test_la_visibilite_ne_depend_d_aucune_etape_prealable(self) -> None:
+        """La différence de fond avec S3, et un risque de moins : la visibilité
+        n'est plus une politique posée sur un contenant — qu'on pouvait oublier
+        de poser — mais une propriété de chaque objet, fixée à l'envoi."""
+        from common.storage import _type_livraison
 
-        assert instruction["Action"] == ["s3:GetObject"]
-        # Ni `ListBucket` — qui reviendrait à publier l'inventaire des fichiers —
-        # ni `PutObject`, qui laisserait n'importe qui écrire dans le catalogue.
-        assert "s3:ListBucket" not in instruction["Action"]
-        assert "s3:PutObject" not in instruction["Action"]
-        assert instruction["Resource"] == ["arn:aws:s3:::test-products/*"]
-
-    def test_un_compartiment_appartenant_a_un_autre_compte_est_signale(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """`403` veut dire « il existe et il n'est pas à vous ». Le créer
-        échouerait ; le dire au démarrage vaut mieux qu'un envoi refusé plus
-        tard, en production."""
-        from botocore.exceptions import ClientError
-
-        class _Interdit(_ClientFactice):
-            def head_bucket(self, Bucket: str) -> None:  # noqa: N803
-                raise ClientError(
-                    {"Error": {"Code": "403"}, "ResponseMetadata": {"HTTPStatusCode": 403}},
-                    "HeadBucket",
-                )
-
-        client = _Interdit()
-        monkeypatch.setattr(StorageService, "_client", staticmethod(lambda: client))
-
-        with override_settings(**STOCKAGE_REEL), pytest.raises(PermissionError):
-            StorageService.ensure_buckets()
+        assert _type_livraison("documents") == "private"
 
 
 class TestServiceDeStockage:
@@ -285,10 +294,9 @@ class TestServiceDeStockage:
         assert StorageService.exists("products", chemin)
 
     def test_deux_fichiers_de_meme_nom_ne_s_ecrasent_pas(self) -> None:
-        """Avec l'écrasement — le défaut de django-storages — deux clients
-        envoyant chacun un `photo.jpg` auraient partagé le même objet : le
-        second aurait remplacé le premier, qui aurait vu la photo d'un inconnu
-        apparaître sur son profil."""
+        """Sans quoi deux clients envoyant chacun un `photo.jpg` auraient
+        partagé le même objet : le second aurait remplacé le premier, qui aurait
+        vu la photo d'un inconnu apparaître sur son profil."""
         from io import BytesIO
 
         premier = StorageService.save("users", "avatars/photo.jpg", BytesIO(b"un"))
@@ -311,67 +319,79 @@ class TestServiceDeStockage:
         # est appelée sans condition sur des chemins de nettoyage.
         StorageService.delete("documents", "")
 
+    def test_la_base_ne_contient_que_le_chemin_relatif(self) -> None:
+        """C'est ce qui rend le fournisseur remplaçable. Une colonne qui
+        contiendrait `https://res.cloudinary.com/...` figerait Cloudinary dans
+        les données — la migration qu'on vient de faire aurait été impossible."""
+        from io import BytesIO
 
-class TestCommandeDeProvisionnement:
+        chemin = StorageService.save("products", "menu/relatif.txt", BytesIO(b"x"))
+
+        assert not chemin.startswith("http")
+        assert chemin.startswith("menu/")
+
+
+class TestCommandeDeVerification:
     """`python manage.py ensure_storage_buckets` — appelée au démarrage."""
 
-    def test_cree_les_compartiments_manquants(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_recapitule_les_dossiers(self) -> None:
         from io import StringIO
 
         from django.core.management import call_command
 
-        client = _ClientFactice()
-        monkeypatch.setattr(StorageService, "_client", staticmethod(lambda: client))
         sortie = StringIO()
 
         with override_settings(**STOCKAGE_REEL):
             call_command("ensure_storage_buckets", stdout=sortie)
 
-        assert "test-products" in sortie.getvalue()
-        assert len(client.crees) == 4
+        texte = sortie.getvalue()
+        assert "test-products" in texte
+        assert "test-documents" in texte
 
-    def test_dry_run_ne_touche_a_rien(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_dry_run_ne_verifie_pas_la_configuration(self) -> None:
+        """Utilisable sans compte, pour lire la correspondance alias → dossier."""
         from io import StringIO
 
         from django.core.management import call_command
 
-        client = _ClientFactice()
-        monkeypatch.setattr(StorageService, "_client", staticmethod(lambda: client))
+        sortie = StringIO()
 
-        with override_settings(**STOCKAGE_REEL):
-            call_command("ensure_storage_buckets", "--dry-run", stdout=StringIO())
+        with override_settings(
+            **{**STOCKAGE_REEL, "CLOUDINARY_API_SECRET": ""},
+        ):
+            call_command("ensure_storage_buckets", "--dry-run", stdout=sortie)
 
-        assert client.crees == []
+        assert "test-products" in sortie.getvalue()
 
-    def test_un_stockage_injoignable_echoue_au_demarrage(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_une_configuration_incomplete_echoue_au_demarrage(self) -> None:
         """Plutôt que de laisser le premier envoi de fichier d'un utilisateur
-        découvrir le problème en production."""
+        découvrir le problème en production, sur une erreur d'authentification
+        que personne ne rapproche d'une variable oubliée."""
         from io import StringIO
 
         from django.core.management import call_command
         from django.core.management.base import CommandError
 
-        def _injoignable() -> None:
-            raise OSError("connexion refusée")
-
-        monkeypatch.setattr(StorageService, "_client", staticmethod(_injoignable))
-
-        with override_settings(**STOCKAGE_REEL), pytest.raises(CommandError):
+        with (
+            override_settings(**{**STOCKAGE_REEL, "CLOUDINARY_API_SECRET": ""}),
+            pytest.raises(CommandError, match="CLOUDINARY_API_SECRET"),
+        ):
             call_command("ensure_storage_buckets", stdout=StringIO())
 
 
 class TestUnePorteUnique:
-    """« Ne jamais accéder directement à MinIO depuis le reste de l'application. »
+    """« Ne jamais accéder directement au stockage depuis le reste de l'application. »
 
     La règle vaut ce que vaut sa vérification. Elle est donc exécutable : le
     jour où l'on ajoute le chiffrement au repos ou une politique de rétention,
     il n'y a qu'un fichier à ouvrir — à condition que personne n'ait ouvert une
     seconde porte entre-temps.
+
+    C'est cette règle qui a rendu le passage de MinIO à Cloudinary possible sans
+    toucher à un seul modèle, sérialiseur ou point d'API.
     """
 
-    INTERDITS: ClassVar[set[str]] = {"boto3", "botocore", "storages"}
+    INTERDITS: ClassVar[set[str]] = {"cloudinary", "boto3", "botocore", "storages"}
     AUTORISE: ClassVar[Path] = BACKEND_ROOT / "common" / "storage.py"
 
     def _modules(self) -> list[Path]:
@@ -384,7 +404,7 @@ class TestUnePorteUnique:
             )
         return fichiers
 
-    def test_seul_common_storage_parle_a_s3(self) -> None:
+    def test_seul_common_storage_parle_au_fournisseur(self) -> None:
         coupables: list[str] = []
 
         for chemin in self._modules():
@@ -408,18 +428,30 @@ class TestUnePorteUnique:
             + ", ".join(sorted(set(coupables)))
         )
 
-    def test_les_reglages_ne_nomment_aucun_compartiment_en_dur(self) -> None:
-        """Un nom de compartiment écrit dans le code se retrouve identique en
+    def test_les_reglages_ne_nomment_aucun_dossier_en_dur(self) -> None:
+        """Un nom de dossier écrit dans le code se retrouve identique en
         développement, en recette et en production — trois environnements qui
-        écriraient dans le même seau."""
+        écriraient au même endroit."""
         source = (BACKEND_ROOT / "config" / "settings" / "base.py").read_text(encoding="utf-8")
 
         # Les valeurs par défaut sont admises (elles servent au développement),
         # mais chacune doit passer par une variable d'environnement.
         for variable in (
-            "S3_BUCKET_PRODUCTS",
-            "S3_BUCKET_BANNERS",
-            "S3_BUCKET_USERS",
-            "S3_BUCKET_DOCUMENTS",
+            "CLOUDINARY_FOLDER_PRODUCTS",
+            "CLOUDINARY_FOLDER_BANNERS",
+            "CLOUDINARY_FOLDER_USERS",
+            "CLOUDINARY_FOLDER_DOCUMENTS",
         ):
             assert f'config("{variable}"' in source
+
+    def test_aucun_identifiant_n_est_ecrit_en_dur(self) -> None:
+        """Les trois valeurs du compte ne doivent exister que dans
+        l'environnement — jamais dans le dépôt."""
+        source = (BACKEND_ROOT / "config" / "settings" / "base.py").read_text(encoding="utf-8")
+
+        for variable in (
+            "CLOUDINARY_CLOUD_NAME",
+            "CLOUDINARY_API_KEY",
+            "CLOUDINARY_API_SECRET",
+        ):
+            assert f'config("{variable}", default="")' in source

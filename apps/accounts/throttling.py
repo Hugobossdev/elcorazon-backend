@@ -1,0 +1,88 @@
+"""Limitation de débit sur l'authentification — T1.
+
+L'implémentation précédente n'avait **aucun** limiteur sur `/auth/login` : la
+force brute était ouverte.
+
+Deux niveaux, et c'est le second qui compte réellement :
+
+* **par adresse IP** — arrête l'attaquant naïf, celui qui martèle depuis une
+  machine ;
+* **par identifiant tenté** — arrête l'attaquant distribué. Sans lui, un botnet
+  répartissant ses tentatives sur mille adresses passe sous le premier limiteur
+  sans le déclencher, tout en essayant mille mots de passe sur le même compte.
+
+Le second est indexé sur l'identifiant **soumis**, pas sur le compte trouvé :
+compter uniquement les comptes existants révélerait lesquels existent, par
+différence de comportement.
+
+Les deux ferment en 503 quand le cache est injoignable (`FailClosedOnCacheOutage`,
+voir `common.throttling`). Ailleurs le compteur n'est qu'une précaution contre la
+boucle automatisée, et le projet préfère alors laisser passer plutôt que de
+rabattre l'API ; ici le compteur *est* la protection. L'ouvrir pendant une panne
+rendrait la force brute libre exactement quand les journaux sont les moins
+lisibles — et une panne de cache, un attaquant peut la provoquer plutôt que
+l'attendre.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from typing import Any
+
+from rest_framework.request import Request
+from rest_framework.throttling import SimpleRateThrottle
+from rest_framework.views import APIView
+
+from common.throttling import FailClosedOnCacheOutage
+
+__all__ = ["AuthCodeIssueThrottle", "AuthIPThrottle", "AuthIdentifierThrottle"]
+
+
+class AuthIPThrottle(FailClosedOnCacheOutage, SimpleRateThrottle):
+    scope = "auth_ip"
+
+    def get_cache_key(self, request: Request, view: APIView) -> str | None:
+        return self.cache_format % {"scope": self.scope, "ident": self.get_ident(request)}
+
+
+class AuthIdentifierThrottle(FailClosedOnCacheOutage, SimpleRateThrottle):
+    """Compte les tentatives visant un même identifiant, toutes origines confondues."""
+
+    scope = "auth_identifier"
+    identifier_field = "email"
+
+    def get_cache_key(self, request: Request, view: APIView) -> str | None:
+        data: Any = getattr(request, "data", None)
+        if not isinstance(data, dict):
+            return None
+
+        identifier = data.get(self.identifier_field)
+        if not identifier or not isinstance(identifier, str):
+            # Requête malformée : elle sera rejetée en validation. La compter
+            # ici permettrait de saturer le compteur d'autrui en envoyant du
+            # vide, ce qui transformerait la protection en déni de service.
+            return None
+
+        # Haché : les clés de cache finissent dans les journaux Redis et les
+        # exports de diagnostic. Une adresse e-mail est une donnée personnelle,
+        # et le comptage n'a pas besoin de sa valeur en clair.
+        digest = hashlib.sha256(identifier.strip().lower().encode()).hexdigest()[:32]
+        return self.cache_format % {"scope": self.scope, "ident": digest}
+
+
+class AuthCodeIssueThrottle(AuthIdentifierThrottle):
+    """Émission d'un code de vérification, comptée par adresse visée.
+
+    Distincte de `AuthIdentifierThrottle`, et à l'heure plutôt qu'à la minute,
+    parce que ce qu'elle protège n'est pas le même bien. Les autres compteurs
+    défendent un compte contre la force brute ; celui-ci défend **une boîte de
+    réception** — la sienne ou celle d'autrui — contre le service employé comme
+    catapulte à courriels, et défend au passage la réputation d'expédition du
+    domaine. Un humain qui n'a pas reçu son code en redemande deux ou trois
+    fois, jamais trente.
+
+    Le compteur est indexé sur l'adresse **soumise**, comme son parent : ne
+    compter que les comptes existants dirait lesquels existent.
+    """
+
+    scope = "auth_code"

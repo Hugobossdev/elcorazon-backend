@@ -1,0 +1,41 @@
+# `.venv*` et non `.venv` : un poste porte souvent plusieurs environnements
+# (`.venv313` pour une version précise de Python). Copiés dans l'image, ils
+# l'alourdissent de centaines de mégaoctets et se font analyser par ruff, qui
+# signale alors des erreurs dans du code de dépendance.
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+.git/
+.gitignore
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+staticfiles/
+media/
+*.md
+
+# Clés et identifiants — **jamais** dans une image.
+#
+# Sans cette ligne, le `COPY . /app` du Dockerfile embarquait `secrets/` : la
+# clé **privée** RS256 qui signe les jetons (`jwt.pem`, et sa jumelle de
+# production sous `secrets/render/`) et le compte de service Firebase
+# (`fcm.json`), en clair, lisibles par l'utilisateur applicatif. Quiconque
+# obtient l'image peut alors forger un jeton d'accès pour n'importe quel compte
+# — le back-office compris — sans jamais toucher au serveur.
+#
+# Rien ne s'en trouve privé à l'exécution : les deux fichiers de compose montent
+# `./secrets:/run/secrets:ro`, et les clés JWT sont de toute façon lues dans
+# l'environnement (`JWT_SIGNING_KEY`), pas dans un fichier — voir `_read_key`
+# dans `config/settings/base.py`.
+secrets/
+
+# Échéancier de beat : un artefact d'exécution, régénéré au démarrage. Il vit
+# désormais dans un volume nommé (voir le service `beat`), mais les fichiers
+# déjà présents dans un arbre de travail n'ont rien à faire dans l'image.
+celerybeat-schedule*

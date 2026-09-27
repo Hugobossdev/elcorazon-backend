@@ -1,0 +1,569 @@
+# Blueprint Render — El Corazón.
+#
+# Périmètre : le service web, **le worker et le battement Celery**, PostgreSQL
+# et deux instances Key Value.
+#
+# ## Ce que ce fichier ne déclarait pas, et ce que ça coûtait
+#
+# Il ne portait que `web` et une seule instance Key Value. Celery n'y figurait
+# pas, avec ce commentaire : « Render ne propose aucune instance gratuite pour
+# les `worker` […] c'est un déploiement de démonstration, pas une exploitation. »
+#
+# La conséquence dépassait la démonstration. `send_push.delay()` est le **seul**
+# appel asynchrone du projet : il empilait dans Redis, et personne ne dépilait.
+# Aucune notification push ne partait — ni l'offre de course au livreur, que
+# l'ADR-008 double par push précisément parce qu'il ne regarde pas son écran en
+# roulant, ni l'alerte « nouvelle commande » au personnel, ni la notification de
+# livraison au client. Poser `PUSH_BACKEND` sur le vrai connecteur, comme le
+# corrige le commit précédent, ne change rien tant que rien ne consomme la file.
+#
+# Les six tâches planifiées étaient à l'arrêt du même coup, dont
+# `loyalty.renew_subscriptions` : les abonnements payants n'étaient jamais
+# renouvelés.
+#
+# ## Ce que l'offre payante implique, et qu'il vaut mieux savoir avant
+#
+# `worker`, `beat` et la seconde instance Key Value **n'existent pas en offre
+# gratuite**. Ce blueprint les déclare en `starter`. Sans budget, la seule
+# alternative honnête est de retirer ces trois blocs et d'assumer, par écrit,
+# qu'aucune notification ne part — pas de laisser croire le contraire.
+#
+# Le service web reste en `free`, et ce qu'il implique n'a pas changé :
+#   — il s'endort après quinze minutes sans requête, et la requête suivante
+#     attend son réveil, une trentaine de secondes ;
+#   — la base gratuite est supprimée au bout d'un mois.
+
+services:
+  # ------------------------------------------------------------------ web
+  - type: web
+    name: elcorazon-backend
+    runtime: docker
+    plan: free
+    # Francfort est la région la plus proche de l'Afrique de l'Ouest : environ
+    # 90 ms depuis Lomé, contre 140 ms par la Virginie et davantage par l'Oregon.
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # Sonde de vivacité sans accès base (`config/urls.py`), déjà exemptée de la
+    # redirection HTTPS par `SECURE_REDIRECT_EXEMPT` dans `prod.py` : Render
+    # l'interroge en clair sur l'adresse interne, et un 301 compterait comme un
+    # échec — le déploiement serait annulé alors que l'application va bien.
+    #
+    # `/health/` et non `/ready/` : Render coupe le trafic et redéploie quand
+    # cette sonde échoue. La lier à PostgreSQL ferait redémarrer en boucle des
+    # conteneurs parfaitement sains le jour d'une indisponibilité de base.
+    # `/ready/`, qui interroge les dépendances, sert au diagnostic et à
+    # l'orchestration, pas à décider d'un redémarrage.
+    healthCheckPath: /health/
+    # `checksPass` et non `commit` : Render n'a le droit de déployer qu'un
+    # commit dont la CI de **ce dépôt** est verte (`.github/workflows/`).
+    #
+    # C'est la moitié manquante de l'autonomie du dépôt. Sur `commit`, un
+    # `git push` déployait immédiatement, CI verte ou rouge — et comme ce dépôt
+    # n'avait aucune CI, « rouge » n'existait même pas. Le code déployé et le
+    # code testé sont maintenant le même commit, par construction.
+    autoDeployTrigger: checksPass
+
+    # Aucun `dockerCommand` : la séquence de démarrage — migrations, fichiers
+    # statiques, compte d'exploitation, données de démonstration, puis uvicorn —
+    # est le `CMD` de l'image, dans `deploy/start-api.sh`.
+    #
+    # Elle y a été déplacée après une panne : `dockerCommand` n'est appliqué
+    # qu'aux services **créés par ce blueprint**. Un service créé à la main
+    # depuis le tableau de bord exécute le `CMD` de l'image et ignore ce
+    # fichier ; les migrations ne passaient donc jamais, et le service tournait
+    # sur une base vide en répondant 200 à `/health/` — qui n'accède pas à la
+    # base — et 500 à tout le reste.
+    #
+    # **Panne corrigée, et à ne pas confondre** avec celle du cache : vue de
+    # l'extérieur, celle-ci a la même allure (200 sur `/health/`, 500 ailleurs)
+    # mais elle épargne les routes protégées, qui répondent 401 — DRF vérifie
+    # les permissions avant les quotas, la requête n'atteint jamais le cache.
+    # Un 401 quelque part disculpe donc la base ; un statique qui répond la
+    # disculpe tout à fait, `collectstatic` suivant `migrate` sous `set -e`.
+    #
+    # Le blueprint ne redit donc pas ce que l'image sait déjà faire : une
+    # commande écrite à deux endroits finit par diverger, et c'est la copie
+    # oubliée qui s'exécute.
+
+    envVars:
+      # Le socle commun aux trois services — voir `envVarGroups` en fin de
+      # fichier. Les recopier ici service par service les ferait diverger, et
+      # `DJANGO_SECRET_KEY` **doit** être identique aux trois : un worker qui
+      # engendrerait la sienne ne saurait déchiffrer aucune session.
+      - fromGroup: elcorazon-commun
+
+      # Le nom d'hôte attribué par Render (`elcorazon-api.onrender.com`). À
+      # compléter à la main le jour où un domaine propre est branché : la
+      # variable accepte une liste séparée par des virgules.
+      #
+      # Propre au web : ni le worker ni le battement ne servent de requête HTTP.
+      - key: DJANGO_ALLOWED_HOSTS
+        fromService:
+          name: elcorazon-backend
+          type: web
+          property: host
+
+      # ------------------------------------------------------- base de données
+      #
+      # Render ne publie sa base que sous forme d'URL unique. `base.py` sait la
+      # décomposer et lui donne la priorité sur les variables `POSTGRES_*`.
+      #
+      # `fromDatabase` ne s'exprime pas dans un groupe de variables : ces
+      # renvois sont résolus par service, et se répètent donc aux trois.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: elcorazon-db
+          property: connectionString
+      - key: POSTGRES_PASSWORD
+        fromDatabase:
+          name: elcorazon-db
+          property: password
+
+      # ------------------------------------------------------- cache et canaux
+      - key: REDIS_URL
+        fromService:
+          name: elcorazon-keyvalue
+          type: keyvalue
+          property: connectionString
+
+      # ------------------------------------------------------- file de tâches
+      #
+      # **Une seconde instance, et c'est le point.** `base.py` fait retomber
+      # `CELERY_BROKER_URL` sur `REDIS_URL` faute de mieux ; les deux usages se
+      # retrouvaient alors sur la même instance en `allkeys-lru`, où une tâche
+      # déjà acceptée peut être évincée sous la pression du cache. Le fichier le
+      # disait lui-même : « une file de tâches ne doit pas être évincée ».
+      - key: CELERY_BROKER_URL
+        fromService:
+          name: elcorazon-broker
+          type: keyvalue
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          name: elcorazon-broker
+          type: keyvalue
+          property: connectionString
+
+      # ------------------------------------------------------- compte d'exploitation
+      #
+      # Lues par `createsuperuser --noinput` (voir `deploy/start-api.sh`).
+      # `DJANGO_SUPERUSER_FULL_NAME` et non `_USERNAME` : `User.USERNAME_FIELD`
+      # vaut `email` et `REQUIRED_FIELDS` contient `full_name`, or la commande
+      # dérive le nom de chaque variable du champ qu'elle renseigne.
+      #
+      # Ces trois variables peuvent être retirées du tableau de bord une fois le
+      # compte créé et son mot de passe changé : le `|| true` absorbe alors
+      # l'échec de la commande.
+      #
+      # Propres au web : lui seul exécute `start-api.sh`.
+      - key: DJANGO_SUPERUSER_EMAIL
+        sync: false
+      - key: DJANGO_SUPERUSER_PASSWORD
+        sync: false
+      - key: DJANGO_SUPERUSER_FULL_NAME
+        sync: false
+
+      # ------------------------------------------------------- données de démo
+      #
+      # Les migrations créent les tables, jamais leur contenu : sans cette
+      # variable, le catalogue répond 200 sur une liste vide et l'application
+      # affiche une carte blanche. `start-api.sh` pose alors l'établissement de
+      # Lomé puis ses cinquante articles, sans photos.
+      #
+      # À retirer le jour où ce déploiement porte de vraies données : le seed
+      # est idempotent et ne réécrit rien, mais garder la variable revient à
+      # laisser une carte de démonstration se reposer à chaque redémarrage.
+      - key: SEED_DEMO_DATA
+        value: "true"
+
+  # --------------------------------------------------------------- worker
+  #
+  # Le consommateur de la file. Sans lui, `send_push.delay()` empile et rien
+  # ne dépile — voir l'en-tête de ce fichier.
+  #
+  # Même image que le web, autre commande : le worker a besoin exactement du
+  # même code et des mêmes réglages, et construire une seconde image les ferait
+  # diverger. `dockerCommand` reprend ce que `docker-compose.yml` lance déjà en
+  # développement, à la concurrence près.
+  - type: worker
+    name: elcorazon-worker
+    runtime: docker
+    # `starter` : Render n'offre aucun `worker` gratuit. Voir l'en-tête.
+    plan: starter
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # `checksPass` et non `commit` : Render n'a le droit de déployer qu'un
+    # commit dont la CI de **ce dépôt** est verte (`.github/workflows/`).
+    #
+    # C'est la moitié manquante de l'autonomie du dépôt. Sur `commit`, un
+    # `git push` déployait immédiatement, CI verte ou rouge — et comme ce dépôt
+    # n'avait aucune CI, « rouge » n'existait même pas. Le code déployé et le
+    # code testé sont maintenant le même commit, par construction.
+    autoDeployTrigger: checksPass
+    # Concurrence 2, comme en développement : les tâches de ce projet sont des
+    # appels réseau (FCM) et des purges SQL, pas du calcul. Monter la
+    # concurrence multiplierait surtout les connexions PostgreSQL, que l'offre
+    # gratuite plafonne.
+    #
+    # Pas de `migrate` ici : c'est le web qui mène les migrations, et deux
+    # services qui les lanceraient au même instant se disputeraient le verrou.
+    dockerCommand: celery -A config worker --loglevel=info --concurrency=2
+
+    envVars:
+      - fromGroup: elcorazon-commun
+      - key: DATABASE_URL
+        fromDatabase:
+          name: elcorazon-db
+          property: connectionString
+      - key: POSTGRES_PASSWORD
+        fromDatabase:
+          name: elcorazon-db
+          property: password
+      - key: REDIS_URL
+        fromService:
+          name: elcorazon-keyvalue
+          type: keyvalue
+          property: connectionString
+      - key: CELERY_BROKER_URL
+        fromService:
+          name: elcorazon-broker
+          type: keyvalue
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          name: elcorazon-broker
+          type: keyvalue
+          property: connectionString
+
+  # ----------------------------------------------------------------- beat
+  #
+  # L'horloge des six tâches planifiées de `config/celery.py`. Séparée du
+  # worker, et **en un seul exemplaire** : deux battements sur le même
+  # calendrier émettent chaque tâche deux fois.
+  - type: worker
+    name: elcorazon-beat
+    runtime: docker
+    plan: starter
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # `checksPass` et non `commit` : Render n'a le droit de déployer qu'un
+    # commit dont la CI de **ce dépôt** est verte (`.github/workflows/`).
+    #
+    # C'est la moitié manquante de l'autonomie du dépôt. Sur `commit`, un
+    # `git push` déployait immédiatement, CI verte ou rouge — et comme ce dépôt
+    # n'avait aucune CI, « rouge » n'existait même pas. Le code déployé et le
+    # code testé sont maintenant le même commit, par construction.
+    autoDeployTrigger: checksPass
+    # `--schedule` sous `/tmp` et non dans `/app` : le répertoire de code est en
+    # lecture seule dans l'image de production, et beat y écrit son dernier
+    # passage à chaque tour.
+    #
+    # Le fichier est perdu au redéploiement, et c'est acceptable : beat repart
+    # alors de l'instant présent. Les six tâches sont toutes des purges ou des
+    # renouvellements idempotents — aucune ne perd quoi que ce soit à sauter un
+    # tour, et aucune ne fait de dégât à en rejouer un.
+    dockerCommand: celery -A config beat --loglevel=info --schedule /tmp/celerybeat-schedule
+
+    envVars:
+      - fromGroup: elcorazon-commun
+      - key: DATABASE_URL
+        fromDatabase:
+          name: elcorazon-db
+          property: connectionString
+      - key: POSTGRES_PASSWORD
+        fromDatabase:
+          name: elcorazon-db
+          property: password
+      - key: REDIS_URL
+        fromService:
+          name: elcorazon-keyvalue
+          type: keyvalue
+          property: connectionString
+      - key: CELERY_BROKER_URL
+        fromService:
+          name: elcorazon-broker
+          type: keyvalue
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          name: elcorazon-broker
+          type: keyvalue
+          property: connectionString
+
+  # ------------------------------------------------------- cache et canaux
+  #
+  # Key Value — l'ex-Redis de Render. Porte le cache Django et la couche de
+  # canaux de Channels. Déclaré dans `services` et non dans `databases` : cette
+  # dernière clé est réservée à PostgreSQL.
+  - type: keyvalue
+    name: elcorazon-keyvalue
+    plan: free
+    region: frankfurt
+    # `allkeys-lru` et non `noeviction`, et c'est **correct pour cet usage-ci** :
+    # l'offre gratuite plafonne à 25 Mio, et une instance pleine en `noeviction`
+    # refuse toute écriture — le cache renverrait des erreurs au lieu de
+    # simplement manquer sa cible. Un défaut de cache est sans conséquence, et
+    # un message de canal perdu est doublé par le push (ADR-008).
+    #
+    # La file de tâches, elle, a maintenant son instance — voir ci-dessous.
+    maxmemoryPolicy: allkeys-lru
+    # Liste vide : seuls les services de ce compte Render joignent l'instance,
+    # par le réseau privé. Aucune adresse publique.
+    ipAllowList: []
+
+  # ------------------------------------------------------- file de tâches
+  #
+  # Séparée du cache, et pour une seule raison : **une tâche acceptée ne doit
+  # pas disparaître**. `noeviction` fait refuser l'écriture quand l'instance est
+  # pleine — la tâche échoue franchement, et Celery le voit — plutôt que
+  # d'évincer silencieusement une tâche déjà en file.
+  #
+  # `allkeys-lru` ici perdrait des notifications sans que rien ne le signale,
+  # c'est-à-dire exactement le défaut que ce blueprint vient de corriger, sous
+  # une autre forme.
+  - type: keyvalue
+    name: elcorazon-broker
+    plan: starter
+    region: frankfurt
+    maxmemoryPolicy: noeviction
+    ipAllowList: []
+
+databases:
+  - name: elcorazon-db
+    plan: free
+    region: frankfurt
+    databaseName: elcorazon
+    user: elcorazon
+    postgresMajorVersion: "17"
+
+# ------------------------------------------------------------------ commun
+#
+# Les réglages partagés par le web, le worker et le battement.
+#
+# **Un groupe plutôt que trois copies.** Trente-cinq variables recopiées aux
+# trois services divergeraient au premier oubli, et le service qui manquerait la
+# correction est celui dont personne ne regarde les journaux. Deux d'entre elles
+# rendent le groupe indispensable plutôt que confortable :
+#
+# * `DJANGO_SECRET_KEY` est engendrée par Render. Déclarée service par service,
+#   chacun obtiendrait la **sienne** — et un jeton signé par le web ne serait
+#   lisible par aucun autre ;
+# * les `sync: false` sont saisies à la main. Trois saisies, c'est trois
+#   occasions de se tromper sur un secret qu'on ne relit jamais.
+#
+# Ce qui n'y figure pas y est absent pour une raison : les renvois
+# `fromDatabase`/`fromService` ne s'expriment pas dans un groupe, et les
+# variables du seul démarrage web (`SEED_DEMO_DATA`, compte d'exploitation)
+# n'ont rien à faire dans un worker.
+envVarGroups:
+  - name: elcorazon-commun
+    envVars:
+      - key: DJANGO_SETTINGS_MODULE
+        value: config.settings.prod
+
+      # `generateValue` engendre 256 bits aléatoires à la création et les
+      # conserve : la clé n'existe nulle part ailleurs, surtout pas dans ce dépôt.
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+
+      - key: POSTGRES_CONN_MAX_AGE
+        value: "60"
+
+      - key: GIS_ENABLED
+        value: "True"
+
+      # ------------------------------------------------------- réseau
+      #
+      # Un proxy entre le client et l'application : celui de Render. **Réglage
+      # de sécurité** — sans lui, DRF prend la chaîne `X-Forwarded-For` entière
+      # pour identité, qu'un client forge à volonté, et la limitation par
+      # adresse IP ne compte plus rien.
+      - key: NUM_PROXIES
+        value: "1"
+
+      - key: LOG_LEVEL
+        value: INFO
+
+      # ------------------------------------------------------- JWT (ADR-004)
+      #
+      # Paire RSA au format PEM, sauts de ligne échappés en `\n` — `base.py` les
+      # rétablit. `sync: false` : Render les demande à la création du blueprint
+      # et ne les écrit jamais dans ce fichier.
+      - key: JWT_SIGNING_KEY
+        sync: false
+      - key: JWT_VERIFYING_KEY
+        sync: false
+
+      # ------------------------------------------------------- stockage objet
+      #
+      # Cloudinary. Les trois valeurs viennent du tableau de bord, section
+      # « API Keys », et sont en `sync: false` : Render les demande à la
+      # création du blueprint et ne les écrit jamais dans ce fichier.
+      #
+      # Rien à provisionner côté fournisseur, contrairement à S3 : un dossier
+      # Cloudinary naît au premier dépôt, et la visibilité est portée par chaque
+      # objet via son type de livraison, décidé à l'envoi par
+      # `common/storage.py`. C'est une étape de configuration en moins — et une
+      # étape de moins qu'on peut oublier de faire.
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      # Ce secret signe les URL des documents privés — pièces d'identité et
+      # permis des livreurs. Il ne quitte jamais le serveur.
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+
+      - key: CLOUDINARY_FOLDER_PRODUCTS
+        value: elcorazon-products
+      - key: CLOUDINARY_FOLDER_BANNERS
+        value: elcorazon-banners
+      - key: CLOUDINARY_FOLDER_USERS
+        value: elcorazon-users
+      - key: CLOUDINARY_FOLDER_DOCUMENTS
+        value: elcorazon-documents
+
+      - key: CLOUDINARY_SIGNED_URL_EXPIRE
+        value: "900"
+
+      # ------------------------------------------------- géocodage inverse
+      #
+      # Clé Google Maps **du serveur**, distincte de celles embarquées dans les
+      # applications : celle-ci se restreint par adresse IP, les autres par
+      # empreinte d'application.
+      #
+      # Elle sert au back-office, qui pose les établissements sur une carte et
+      # demande au serveur ce qu'il y a à cet endroit. Absente, la route répond
+      # 503 avec une phrase qui dit quoi faire, et le back-office reste
+      # utilisable en saisie manuelle de coordonnées — c'est une dégradation,
+      # pas une panne.
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
+
+      # ------------------------------------------------------- messagerie
+      #
+      # `prod.py` lit ces quatre variables sans valeur de repli : leur absence
+      # empêche le chargement des réglages, donc le démarrage. Elles sont donc
+      # nécessaires au worker autant qu'au web.
+      - key: EMAIL_HOST
+        sync: false
+      - key: EMAIL_PORT
+        value: "587"
+      - key: EMAIL_HOST_USER
+        sync: false
+      - key: EMAIL_HOST_PASSWORD
+        sync: false
+      - key: DEFAULT_FROM_EMAIL
+        sync: false
+
+      # ------------------------------------------------------- notifications push
+      #
+      # Ce fichier n'en portait aucune trace, et l'omission ne se voyait pas :
+      # sans `PUSH_BACKEND`, `base.py` retombe sur `ConsolePushBackend`, qui
+      # journalise et déclare **tous les jetons livrés**. Aucune erreur, aucune
+      # reprise, aucune métrique — un déploiement muet qui se croit sain.
+      #
+      # `prod.py` refuse maintenant de démarrer sur la console, ce qui transforme
+      # cet oubli en échec de déploiement plutôt qu'en silence.
+      #
+      # C'est le **worker** qui s'en sert : `send_push` y tourne. Le web n'en a
+      # besoin que pour que ses réglages chargent.
+      - key: PUSH_BACKEND
+        value: apps.notifications.fcm.FirebaseCloudMessagingBackend
+
+      # Le compte de service est un JSON multiligne : il ne passe pas par une
+      # variable d'environnement. Il se dépose en **Secret File** nommé
+      # `fcm.json` dans le tableau de bord Render, qui le monte sous
+      # `/etc/secrets/`. C'est l'équivalent du `/run/secrets` que `docker
+      # compose` monte en local — seul le chemin change.
+      #
+      # **À déposer sur le worker autant que sur le web** : un Secret File est
+      # attaché à un service, pas à un groupe de variables.
+      - key: FCM_CREDENTIALS_PATH
+        value: /etc/secrets/fcm.json
+
+      # L'identifiant du projet Firebase, qui compose l'URL d'envoi. Une valeur
+      # fausse ici ne se voit qu'au premier envoi, en 404 sur `messages:send`.
+      - key: FCM_PROJECT_ID
+        sync: false
+
+      - key: FCM_TIMEOUT_SECONDS
+        value: "10"
+
+      # ------------------------------------------------------- paiement
+      #
+      # **Ces quatre variables manquaient, et l'omission était exploitable.**
+      #
+      # `base.py` fait retomber `PAYDUNYA_GATEWAY` sur `SandboxGateway` et
+      # `PAYMENT_WEBHOOK_SECRET` sur la chaîne vide. Le déploiement encaissait
+      # donc par le bac à sable, dont `parse()` lit le statut **dans le corps
+      # posté** au lieu de le confirmer auprès du prestataire — et dont
+      # `authenticate()` compare un HMAC calculé avec une clé vide, c'est-à-dire
+      # connue de quiconque lit ce dépôt.
+      #
+      # Or `POST /payments/{order}/initiate/` rend au client sa propre
+      # `provider_reference`. Il ne restait donc rien à deviner : un client
+      # pouvait signer lui-même une notification « encaissé » et faire confirmer
+      # sa commande sans payer.
+      #
+      # `prod.py` refuse maintenant de démarrer sur le bac à sable ou sur un
+      # secret vide. Ces variables sont ce qui lui permet de démarrer.
+      - key: PAYDUNYA_GATEWAY
+        value: apps.payments.paydunya.PayDunyaGateway
+
+      # `test` vise le bac à sable **du prestataire** — une vraie facture, sans
+      # mouvement d'argent. `live` encaisse pour de bon : c'est la seule
+      # variable dont une erreur se paie en argent réel. Elle reste donc à
+      # `test` dans ce fichier, et se bascule sciemment au tableau de bord.
+      - key: PAYDUNYA_MODE
+        value: test
+
+      - key: PAYDUNYA_MASTER_KEY
+        sync: false
+      - key: PAYDUNYA_PRIVATE_KEY
+        sync: false
+      - key: PAYDUNYA_TOKEN
+        sync: false
+
+      # L'adresse que PayDunya rappelle. Elle doit pointer sur
+      # `https://<hôte>/api/v1/payments/webhook/paydunya/` — saisie à la main
+      # parce qu'un groupe de variables ne sait pas lire le nom d'hôte d'un
+      # service.
+      - key: PAYDUNYA_CALLBACK_URL
+        sync: false
+
+      # Signe les notifications du bac à sable interne (`SandboxGateway`), qui
+      # sert aux espèces et au portefeuille. Vide, il rendrait toute signature
+      # calculable — d'où le refus de démarrage.
+      - key: PAYMENT_WEBHOOK_SECRET
+        generateValue: true
+
+      # ------------------------------------------------------- métier
+      - key: DEFAULT_CURRENCY
+        value: XOF
+      - key: COURIER_FEE_SHARE_PERCENT
+        value: "80"
+
+      # ------------------------------------------------- origines autorisées
+      #
+      # `CORS_ALLOW_LOCAL_DEV_ORIGINS` était **absente**, donc vraie par défaut
+      # (`prod.py`) : l'API de production acceptait les origines
+      # `http://localhost:<port>`. C'était délibéré tant qu'aucun back-office
+      # n'avait d'adresse stable, et ça ne l'est plus dès qu'une l'a.
+      #
+      # Elle est maintenant déclarée **explicitement à faux**. Le jour où l'on
+      # veut à nouveau faire parler un Flutter Web local à ce déploiement, on la
+      # repasse à `true` au tableau de bord — un geste conscient, et réversible.
+      - key: CORS_ALLOW_LOCAL_DEV_ORIGINS
+        value: "false"
+
+      # À renseigner depuis le tableau de bord, avec le schéma
+      # (`https://admin.exemple.app`). Vide ne veut pas dire ouvert :
+      # `CORS_ALLOW_ALL_ORIGINS` est faux en production.
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: CSRF_TRUSTED_ORIGINS
+        sync: false

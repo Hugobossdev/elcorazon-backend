@@ -108,6 +108,35 @@ def charger_prod(**surcharges: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def charger_prod_et_lire_paydunya(**surcharges: str) -> subprocess.CompletedProcess[str]:
+    """Comme `charger_prod`, mais imprime le connecteur résolu pour `paydunya`.
+
+    Contrairement à `PUSH_BACKEND`, l'absence d'une configuration réelle de
+    `PAYDUNYA_GATEWAY` ne fait plus échouer le chargement (voir
+    `TestConnecteurDePaiement`) : la seule façon de vérifier le refus est de
+    lire ce sur quoi `PAYMENT_GATEWAYS["paydunya"]` a été redirigé.
+    """
+    environnement = {
+        "PATH": os.environ.get("PATH", ""),
+        "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+        **ENVIRONNEMENT_MINIMAL,
+        **surcharges,
+    }
+    return subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            "import config.settings.prod as p; import sys; "
+            "sys.stdout.write(p.PAYMENT_GATEWAYS['paydunya'])",
+        ],
+        cwd=RACINE,
+        env=environnement,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 class TestServiceDeNotificationPush:
     def test_le_defaut_declare_par_base_est_la_console(self) -> None:
         """L'absence de la variable **vaut** la console.
@@ -160,7 +189,7 @@ class TestServiceDeNotificationPush:
 
 
 class TestConnecteurDePaiement:
-    """Le même piège que le push, en plus coûteux.
+    """Le même piège que le push, en plus coûteux — et refusé plus finement.
 
     `SandboxGateway` n'est pas une maquette inerte : il ouvre des paiements,
     accepte des notifications et solde des commandes. Il diffère du vrai sur les
@@ -170,6 +199,15 @@ class TestConnecteurDePaiement:
 
     Le blueprint de production ne déclarait aucune variable de paiement. Le
     déploiement encaissait donc par le bac à sable, sans que rien ne le signale.
+
+    À la différence de `PUSH_BACKEND`, dont l'absence fait échouer le
+    démarrage entier, une absence de `PAYDUNYA_GATEWAY` ne ferme plus que les
+    paiements : `PAYMENT_GATEWAYS["paydunya"]` est redirigé vers
+    `UnavailableGateway` (refus en 502 à l'appel), et le reste du service —
+    catalogue, back-office, espèces, portefeuille — démarre normalement. Fermer
+    le service entier pour ce seul défaut coûtait plus qu'il ne protégeait :
+    aucune commande ne pouvait plus être prise, y compris payées en espèces à
+    la livraison.
     """
 
     def test_le_defaut_declare_par_base_est_le_bac_a_sable(self) -> None:
@@ -186,28 +224,39 @@ class TestConnecteurDePaiement:
             "de `prod.py` ne couvre alors plus l'absence de la variable."
         )
 
-    def test_le_bac_a_sable_est_refuse_en_production(self) -> None:
-        resultat = charger_prod(PAYDUNYA_GATEWAY=BAC_A_SABLE)
+    def test_le_bac_a_sable_ferme_le_paiement_pas_le_service(self) -> None:
+        """La production démarre, mais `paydunya` est redirigé sur le refus.
 
-        assert resultat.returncode != 0, (
-            "La production a démarré sur SandboxGateway : elle n'encaissera rien "
-            "et croira sur parole le statut posté dans les notifications."
+        Le service entier ne doit plus tomber pour ce seul défaut — voir le
+        docstring de la classe. Ce qui reste à vérifier est que le paiement
+        mobile money, lui, est bien fermé plutôt que silencieusement servi par
+        le bac à sable.
+        """
+        resultat = charger_prod_et_lire_paydunya(PAYDUNYA_GATEWAY=BAC_A_SABLE)
+
+        assert resultat.returncode == 0, resultat.stderr[-2000:]
+        assert resultat.stdout == "apps.payments.gateway.UnavailableGateway", (
+            "PAYDUNYA_GATEWAY vaut le bac à sable, mais PAYMENT_GATEWAYS['paydunya'] "
+            f"n'a pas été redirigé vers le refus : {resultat.stdout!r}."
         )
-        assert "PAYDUNYA_GATEWAY" in resultat.stderr
-        # Le message doit dire quoi poser : il est lu par quelqu'un qui déploie.
-        assert PAYDUNYA in resultat.stderr
 
-    def test_l_absence_de_variable_est_refusee(self) -> None:
+    def test_l_absence_de_variable_ferme_le_paiement_pas_le_service(self) -> None:
         """Le cas réellement survenu : la variable n'existait nulle part.
 
         Distinct du précédent — celui-ci passe une valeur, celui-là n'en passe
-        aucune et laisse le repli de `base.py` s'appliquer.
+        aucune et laisse le repli de `base.py` s'appliquer. Le résultat attendu
+        est le même : service démarré, paiement mobile money fermé.
         """
         environnement = dict(ENVIRONNEMENT_MINIMAL)
         del environnement["PAYDUNYA_GATEWAY"]
 
         resultat = subprocess.run(  # noqa: S603
-            [sys.executable, "-c", "import config.settings.prod"],
+            [
+                sys.executable,
+                "-c",
+                "import config.settings.prod as p; import sys; "
+                "sys.stdout.write(p.PAYMENT_GATEWAYS['paydunya'])",
+            ],
             cwd=RACINE,
             env={
                 "PATH": os.environ.get("PATH", ""),
@@ -219,8 +268,8 @@ class TestConnecteurDePaiement:
             check=False,
         )
 
-        assert resultat.returncode != 0
-        assert "PAYDUNYA_GATEWAY" in resultat.stderr
+        assert resultat.returncode == 0, resultat.stderr[-2000:]
+        assert resultat.stdout == "apps.payments.gateway.UnavailableGateway"
 
     def test_le_connecteur_paydunya_passe(self) -> None:
         """Le contrôle ne doit pas refuser ce qu'il est censé exiger."""

@@ -179,7 +179,8 @@ if config("PUSH_BACKEND", default="apps.notifications.push.ConsolePushBackend").
         "PUSH_BACKEND=apps.notifications.fcm.FirebaseCloudMessagingBackend."
     )
 
-# Le connecteur de **paiement** est le même piège, en plus coûteux.
+# Le connecteur de **paiement** est le même piège, en plus coûteux — mais son
+# absence ne doit fermer que les paiements, pas le service entier.
 #
 # `base.py` fait retomber `PAYDUNYA_GATEWAY` sur `apps.payments.gateway.
 # SandboxGateway`. Ce connecteur n'est pas une maquette inerte : il ouvre des
@@ -204,21 +205,22 @@ if config("PUSH_BACKEND", default="apps.notifications.push.ConsolePushBackend").
 # lui-même une notification « encaissé » et faire confirmer sa commande sans
 # payer.
 #
-# Comme pour le push, le contrôle porte sur la **classe** et non sur les
-# identifiants : ce sont eux qui sont vérifiés à l'usage, par le connecteur, et
-# un jeu d'identifiants valide branché sur le bac à sable resterait sans effet.
-#
-# Le défaut répété ici est celui de `base` — et non `""` : c'est **l'absence**
-# de la variable qui constitue le défaut qu'on attrape, et c'est le seul cas
-# qui se soit réellement produit.
+# Un `RuntimeError` au chargement des réglages fermait tout le service pour ce
+# seul défaut — catalogue et back-office compris, qui n'en dépendent pas. Le
+# contrôle porte ici sur la **classe**, comme pour le push, mais la sanction ne
+# tue plus le processus : `PAYMENT_GATEWAYS["paydunya"]` est redirigé vers
+# `UnavailableGateway`, qui refuse (502) tout appel à `open_checkout` et
+# `parse`, et n'authentifie jamais une notification. Les espèces et le
+# portefeuille, qui ne dépendent pas de cette variable, continuent de
+# fonctionner. Jamais de repli vers `SandboxGateway` : c'est justement lui qui
+# rendait l'encaissement mobile money forgeable.
 if config("PAYDUNYA_GATEWAY", default="apps.payments.gateway.SandboxGateway").endswith(
     "SandboxGateway"
 ):
-    raise RuntimeError(
-        "PAYDUNYA_GATEWAY pointe sur SandboxGateway, qui n'encaisse rien et croit "
-        "sur parole le statut posté dans la notification. En production, poser "
-        "PAYDUNYA_GATEWAY=apps.payments.paydunya.PayDunyaGateway."
-    )
+    PAYMENT_GATEWAYS = {  # noqa: F405
+        **PAYMENT_GATEWAYS,  # noqa: F405
+        "paydunya": "apps.payments.gateway.UnavailableGateway",
+    }
 
 # Le secret des notifications, lui, s'oublie en restant **vide** — et un HMAC
 # calculé avec une clé vide se recalcule par quiconque lit ce dépôt.

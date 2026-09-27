@@ -36,6 +36,7 @@ __all__ = [
     "Notification",
     "PaymentGateway",
     "SandboxGateway",
+    "UnavailableGateway",
     "gateway_for",
 ]
 
@@ -194,6 +195,44 @@ class SandboxGateway:
             # ferait passer la notification pour « sans montant », donc sans
             # contrôle. `GatewayError` la fait tracer sans être rejouée.
             raise GatewayError(f"Montant de notification illisible : {brut!r}.") from None
+
+
+class UnavailableGateway:
+    """Connecteur refusé — utilisé quand `paydunya` démarre sans configuration réelle.
+
+    `prod.py` posait auparavant un `RuntimeError` au chargement des réglages :
+    le processus entier refusait de démarrer tant que `PAYDUNYA_GATEWAY`
+    n'était pas branché sur `PayDunyaGateway`, ce qui emportait aussi bien le
+    catalogue et le back-office que les paiements. Ce connecteur déplace le
+    refus de l'échec de démarrage à l'appel : le déploiement démarre, les
+    espèces et le portefeuille fonctionnent (ils ne dépendent pas de
+    `PAYDUNYA_GATEWAY`), et seul `POST /payments/*/initiate/` avec
+    `provider="paydunya"` échoue, en 502 (`GatewayError`), tant que la vraie
+    configuration n'est pas posée.
+
+    Ne remplace jamais silencieusement par `SandboxGateway` : c'est justement
+    ce repli qui rendait un encaissement mobile money forgeable — voir
+    `SandboxGateway` et `PayDunyaGateway`.
+    """
+
+    def open_checkout(self, transaction: Transaction) -> CheckoutInstruction:
+        raise GatewayError(
+            "Paiement mobile money indisponible : PAYDUNYA_GATEWAY n'est pas "
+            "configuré sur ce déploiement."
+        )
+
+    def authenticate(
+        self, *, raw_body: bytes, headers: Mapping[str, str], data: Mapping[str, Any]
+    ) -> bool:
+        # Aucune configuration réelle n'existe pour vérifier quoi que ce soit :
+        # refuser est le seul choix qui ne prétende pas authentifier une
+        # notification qu'aucun secret ne protège.
+        return False
+
+    def parse(self, data: Mapping[str, Any]) -> Notification:
+        raise GatewayError(
+            "Paiement mobile money indisponible : PAYDUNYA_GATEWAY n'est pas configuré."
+        )
 
 
 def gateway_for(provider: str) -> PaymentGateway:
